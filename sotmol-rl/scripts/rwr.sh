@@ -1,0 +1,1 @@
+python train_rl_objective.py --config rl.json --objective_name qed --project_name SOTMOL_RWR_QED
