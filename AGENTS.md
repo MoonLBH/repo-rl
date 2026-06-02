@@ -3,7 +3,7 @@
 本仓库是一个迁移工作仓库，不是最终发布仓库。
 
 目录结构：
-- sotmol-rl/：我的方法代码，暂时命令为LIFT。该方法使用 RL / reward-guided fine-tuning 调整无条件 3D flow matching 分子生成模型。train——lift_*.py文件是我的方法在不同任务上的训练脚本。
+- sotmol-rl/：我的方法代码，暂时命令为LIFT。该方法使用 RL / reward-guided fine-tuning 调整无条件 3D flow matching 分子生成模型。train_lift_*.py文件是我的方法在不同任务上的训练脚本。
 - flowr/：目标代码库。该项目是 structure-based 的三维配体生成与优化框架。
 - migration_notes/：只用于保存迁移分析文档、接口映射和实施计划。
 
