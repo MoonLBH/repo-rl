@@ -279,7 +279,7 @@ python scripts/test_structure_rewards.py \
 - `flowr.util.metrics.interaction_recovery_per_complex` for PLIF Tanimoto。
 - `flowr.util.metrics.evaluate_strain` for strain energy。
 - `flowr.util.metrics.evaluate_gbsb3` for Vina score。
-- `flowr.eval.evaluate_util.gather_predictions` 的 output schema；Stage 1 wrapper 直接读取 `predictions_multi_*.pt` 中的 `gen_ligs`, `ref_ligs`, `ref_pdbs`，并优先用 `ref_ligs_with_hs` / `ref_pdbs_with_hs` 计算 PLIF，以匹配 `evaluate_interactions.py` 的原始做法。
+- `flowr.eval.evaluate_util.gather_predictions` 的 output schema；Stage 1 wrapper 直接读取 `predictions_multi_*.pt` 中的 `gen_ligs`, `ref_ligs`, `ref_pdbs`，并优先用 `ref_ligs_with_hs` / `ref_pdbs_with_hs` 计算 PLIF、PoseBusters validity 和 Vina，以匹配 `evaluate_interactions.py` 与 `evaluate_metrics.py` 对 structure metrics 的原始做法。
 
 不直接复用 shell：
 

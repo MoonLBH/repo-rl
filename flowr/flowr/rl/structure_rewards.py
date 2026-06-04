@@ -361,6 +361,8 @@ def _coerce_records(
             "mol": mol,
             "protein_file": protein_file_str,
             "reference_ligand": reference_ligand,
+            "structure_protein_file": protein_file_str,
+            "structure_reference_ligand": reference_ligand,
             "plif_protein_file": protein_file_str,
             "plif_reference_ligand": reference_ligand,
         }
@@ -386,8 +388,10 @@ def _records_from_flowr_sampling_output(path: str | Path) -> list[dict[str, Any]
         for target_idx, gen_ligs in enumerate(payload["gen_ligs"]):
             ref_lig = payload["ref_ligs"][target_idx]
             protein_file = payload["ref_pdbs"][target_idx]
-            plif_ref_lig = payload["ref_ligs_with_hs"][target_idx] if has_plif_refs else ref_lig
-            plif_protein_file = payload["ref_pdbs_with_hs"][target_idx] if has_plif_refs else protein_file
+            structure_ref_lig = payload["ref_ligs_with_hs"][target_idx] if has_plif_refs else ref_lig
+            structure_protein_file = payload["ref_pdbs_with_hs"][target_idx] if has_plif_refs else protein_file
+            plif_ref_lig = structure_ref_lig
+            plif_protein_file = structure_protein_file
             for lig_idx, mol in enumerate(gen_ligs):
                 records.append(
                     {
@@ -395,9 +399,11 @@ def _records_from_flowr_sampling_output(path: str | Path) -> list[dict[str, Any]
                         "mol": mol,
                         "protein_file": protein_file,
                         "reference_ligand": ref_lig,
+                        "structure_protein_file": structure_protein_file,
+                        "structure_reference_ligand": structure_ref_lig,
                         "plif_protein_file": plif_protein_file,
                         "plif_reference_ligand": plif_ref_lig,
-                        "metadata": {"has_plif_with_hs_refs": has_plif_refs},
+                        "metadata": {"has_structure_with_hs_refs": has_plif_refs, "has_plif_with_hs_refs": has_plif_refs},
                     }
                 )
         return records
@@ -415,8 +421,10 @@ def _compute_single_record_reward(record: Mapping[str, Any], config: RewardConfi
     mol = record.get("mol")
     protein_file = record.get("protein_file")
     reference_ligand = record.get("reference_ligand")
-    plif_protein_file = record.get("plif_protein_file", protein_file)
-    plif_reference_ligand = record.get("plif_reference_ligand", reference_ligand)
+    structure_protein_file = record.get("structure_protein_file", protein_file)
+    structure_reference_ligand = record.get("structure_reference_ligand", reference_ligand)
+    plif_protein_file = record.get("plif_protein_file", structure_protein_file)
+    plif_reference_ligand = record.get("plif_reference_ligand", structure_reference_ligand)
     enabled = config.enabled_metrics()
     result = StructureRewardResult(
         sample_id=sample_id,
@@ -433,7 +441,7 @@ def _compute_single_record_reward(record: Mapping[str, Any], config: RewardConfi
 
     if config.compute_posebusters_validity or config.require_posebusters_validity:
         pb_value = _safe_metric_value(
-            lambda: _compute_posebusters_validity(mol, protein_file, reference_ligand, config), errors, "posebusters_validity"
+            lambda: _compute_posebusters_validity(mol, structure_protein_file, structure_reference_ligand, config), errors, "posebusters_validity"
         )
         result.posebusters_valid = bool(pb_value) if pb_value is not None else False
     else:
@@ -452,7 +460,7 @@ def _compute_single_record_reward(record: Mapping[str, Any], config: RewardConfi
         result.strain_energy = value
         result.strain_success = value is not None
     if "vina" in enabled or config.compute_non_enabled_metrics:
-        value = _safe_metric_value(lambda: _compute_vina_score(mol, protein_file, reference_ligand, config), errors if "vina" in enabled else warnings, "vina")
+        value = _safe_metric_value(lambda: _compute_vina_score(mol, structure_protein_file, structure_reference_ligand, config), errors if "vina" in enabled else warnings, "vina")
         result.vina_score = value
         result.vina_success = value is not None
 
