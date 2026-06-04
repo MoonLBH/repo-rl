@@ -354,12 +354,15 @@ def _coerce_records(
         raise ValueError("Provide generated_mols, generated_ligand_file, or flowr_sampling_output")
 
     ids = sample_ids or [f"sample_{idx}" for idx in range(len(generated_mols))]
+    protein_file_str = str(protein_file) if protein_file is not None else None
     return [
         {
             "sample_id": ids[idx],
             "mol": mol,
-            "protein_file": str(protein_file) if protein_file is not None else None,
+            "protein_file": protein_file_str,
             "reference_ligand": reference_ligand,
+            "plif_protein_file": protein_file_str,
+            "plif_reference_ligand": reference_ligand,
         }
         for idx, mol in enumerate(generated_mols)
     ]
@@ -379,9 +382,12 @@ def _records_from_flowr_sampling_output(path: str | Path) -> list[dict[str, Any]
     records: list[dict[str, Any]] = []
 
     if "gen_ligs" in payload and "ref_ligs" in payload and "ref_pdbs" in payload:
+        has_plif_refs = "ref_ligs_with_hs" in payload and "ref_pdbs_with_hs" in payload
         for target_idx, gen_ligs in enumerate(payload["gen_ligs"]):
             ref_lig = payload["ref_ligs"][target_idx]
             protein_file = payload["ref_pdbs"][target_idx]
+            plif_ref_lig = payload["ref_ligs_with_hs"][target_idx] if has_plif_refs else ref_lig
+            plif_protein_file = payload["ref_pdbs_with_hs"][target_idx] if has_plif_refs else protein_file
             for lig_idx, mol in enumerate(gen_ligs):
                 records.append(
                     {
@@ -389,6 +395,9 @@ def _records_from_flowr_sampling_output(path: str | Path) -> list[dict[str, Any]
                         "mol": mol,
                         "protein_file": protein_file,
                         "reference_ligand": ref_lig,
+                        "plif_protein_file": plif_protein_file,
+                        "plif_reference_ligand": plif_ref_lig,
+                        "metadata": {"has_plif_with_hs_refs": has_plif_refs},
                     }
                 )
         return records
@@ -406,6 +415,8 @@ def _compute_single_record_reward(record: Mapping[str, Any], config: RewardConfi
     mol = record.get("mol")
     protein_file = record.get("protein_file")
     reference_ligand = record.get("reference_ligand")
+    plif_protein_file = record.get("plif_protein_file", protein_file)
+    plif_reference_ligand = record.get("plif_reference_ligand", reference_ligand)
     enabled = config.enabled_metrics()
     result = StructureRewardResult(
         sample_id=sample_id,
@@ -433,7 +444,7 @@ def _compute_single_record_reward(record: Mapping[str, Any], config: RewardConfi
         return result
 
     if "plif" in enabled or config.compute_non_enabled_metrics:
-        value = _safe_metric_value(lambda: _compute_plif_tanimoto(mol, protein_file, reference_ligand), errors if "plif" in enabled else warnings, "plif")
+        value = _safe_metric_value(lambda: _compute_plif_tanimoto(mol, plif_protein_file, plif_reference_ligand), errors if "plif" in enabled else warnings, "plif")
         result.plif_tanimoto = value
         result.plif_success = value is not None
     if "strain" in enabled or config.compute_non_enabled_metrics:
@@ -461,8 +472,14 @@ def _compute_single_record_reward(record: Mapping[str, Any], config: RewardConfi
     result.normalized_strain_score = score_info["normalized_strain_score"]
     result.normalized_vina_score = score_info["normalized_vina_score"]
     result.metric_success = result.feasible
-    result.error = score_info["error"] or ("; ".join(errors) if errors else None)
+    scoring_error = score_info["error"]
+    detailed_errors = "; ".join(errors) if errors else None
+    if scoring_error and detailed_errors:
+        result.error = f"{scoring_error}; {detailed_errors}"
+    else:
+        result.error = scoring_error or detailed_errors
     result.warning = "; ".join(warnings) if warnings else None
+    result.metadata.update(record.get("metadata", {}))
     return result
 
 
