@@ -1,5 +1,10 @@
 """Default-off reward/objective utilities for FLOWR migration experiments."""
 
+from flowr.rl.structure_selection import (
+    SelectionConfig,
+    select_top_middle_bottom,
+    select_top_middle_bottom_with_config,
+)
 from flowr.rl.structure_rewards import (
     ObjectiveMode,
     RewardConfig,
@@ -9,6 +14,9 @@ from flowr.rl.structure_rewards import (
 )
 
 __all__ = [
+    "select_top_middle_bottom_with_config",
+    "select_top_middle_bottom",
+    "SelectionConfig",
     "ObjectiveMode",
     "RewardConfig",
     "StructureRewardResult",
