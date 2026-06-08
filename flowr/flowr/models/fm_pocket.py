@@ -20,6 +20,7 @@ import flowr.util.metrics as Metrics
 import flowr.util.rdkit as smolRD
 from flowr.data.data_info import GeneralInfos as DataInfos
 from flowr.models.semla import MolecularGenerator
+from flowr.rl.training import maybe_apply_rl_finetune_loss
 from flowr.util.molrepr import GeometricMol
 from flowr.util.tokeniser import Vocabulary
 
@@ -1465,6 +1466,7 @@ class LigandPocketCFM(pl.LightningModule):
         lig_data = self.builder.extract_ligand_from_complex(data)
         lig_data["interactions"] = data["interactions"]
         lig_data["pocket_mask"] = pocket_data["mask"]
+        lig_data["complex"] = data.get("complex")
         times = [times[:, 0], times[:, 1], times[:, 2], times[:, 3]]
 
         cond_batch = None
@@ -1525,12 +1527,23 @@ class LigandPocketCFM(pl.LightningModule):
 
         losses = self._loss(lig_data, lig_interp, predicted, times=ligand_times)
         loss = sum(list(losses.values()))
+        loss, rl_logs = maybe_apply_rl_finetune_loss(self, loss, lig_data, predicted)
 
         for name, loss_val in losses.items():
             self.log(
                 f"train-{name}",
                 loss_val,
                 prog_bar=True,
+                on_step=True,
+                logger=True,
+                sync_dist=True,
+            )
+
+        for name, log_val in rl_logs.items():
+            self.log(
+                name,
+                log_val,
+                prog_bar=False,
                 on_step=True,
                 logger=True,
                 sync_dist=True,
