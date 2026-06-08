@@ -1,9 +1,9 @@
 """Structure-based reward wrappers for FLOWR generated ligands.
 
-This module is intentionally default-off: it is not imported by FLOWR's training,
-sampling, or evaluation entrypoints unless a user calls it explicitly.  It wraps
-FLOWR's existing structure metrics into per-sample reward dictionaries suitable
-for future reward-guided fine-tuning experiments.
+This module is intentionally default-off: importing it has no side effects, and
+metric computation only occurs when a caller explicitly enables the reward-guided
+path.  It wraps FLOWR's existing structure metrics into per-sample reward
+dictionaries suitable for future reward-guided fine-tuning experiments.
 """
 
 from __future__ import annotations
@@ -242,7 +242,9 @@ def compute_main_score(
         )
 
     weights = {"plif": config.plif_weight, "strain": config.strain_weight, "vina": config.vina_weight}
-    passes = _passes_thresholds(normalized, config)
+    # Single-objective RL uses normalized score ranking only; hard objective
+    # thresholds are reserved for two-/three-objective non-compensatory gating.
+    passes = True if len(enabled) == 1 else _passes_thresholds(normalized, config)
     strategy = config.multiobjective_strategy
 
     if strategy == MultiObjectiveStrategy.HARD_GATE_THEN_WEIGHTED_SUM.value:
@@ -329,6 +331,21 @@ def compute_structure_rewards(
         flowr_sampling_output=flowr_sampling_output,
         sample_ids=sample_ids,
     )
+    return compute_structure_rewards_from_records(records, config=config)
+
+
+def compute_structure_rewards_from_records(
+    records: Iterable[Mapping[str, Any]], *, config: Optional[RewardConfig] = None
+) -> list[dict[str, Any]]:
+    """Compute per-ligand structure rewards from already-coerced records.
+
+    This is used by default-off train-time RL wrappers that can construct
+    in-memory records containing generated RDKit mols plus per-sample pocket and
+    reference ligand objects.  It keeps the same reward dict schema as
+    ``compute_structure_rewards``.
+    """
+
+    config = config or RewardConfig()
     return [_compute_single_record_reward(record, config).to_dict() for record in records]
 
 

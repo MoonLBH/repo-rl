@@ -265,9 +265,9 @@ def cached_rewards_for_file(
 ) -> Optional[list[dict[str, Any]]]:
     if not cache:
         return None
-    try:
-        from flowr.rl.structure_rewards import _records_from_flowr_sampling_output
+    from flowr.rl.structure_rewards import _records_from_flowr_sampling_output
 
+    try:
         records = _records_from_flowr_sampling_output(file_path)
     except Exception:
         return None
@@ -295,10 +295,7 @@ def load_or_compute_rewards(args: argparse.Namespace, files: Sequence[Path], sou
 
 
 def attach_molecules(rewards: Sequence[Mapping[str, Any]], files: Sequence[Path]) -> list[dict[str, Any]]:
-    try:
-        from flowr.rl.structure_rewards import _records_from_flowr_sampling_output
-    except Exception:
-        return [dict(reward) for reward in rewards]
+    from flowr.rl.structure_rewards import _records_from_flowr_sampling_output
 
     mols_by_id: dict[str, Any] = {}
     for file_path in files:
@@ -360,9 +357,9 @@ def infer_pocket_id(row: Mapping[str, Any]) -> str:
 def mol_to_smiles(mol: Any) -> str:
     if mol is None:
         return ""
-    try:
-        from rdkit import Chem
+    from rdkit import Chem
 
+    try:
         return Chem.MolToSmiles(mol)
     except Exception:
         return ""

@@ -11,6 +11,7 @@ from flowr.rl.structure_rewards import (
     StructureRewardResult,
     compute_main_score,
     compute_structure_rewards,
+    compute_structure_rewards_from_records,
 )
 
 __all__ = [
@@ -22,4 +23,5 @@ __all__ = [
     "StructureRewardResult",
     "compute_main_score",
     "compute_structure_rewards",
+    "compute_structure_rewards_from_records",
 ]

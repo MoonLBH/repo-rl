@@ -291,17 +291,18 @@ def _diagnose_reward(reward: Mapping[str, Any], enabled: Sequence[str], config: 
             reasons.append(f"{metric}_failed")
 
     threshold_failed = False
-    if "plif" in enabled and _metric_success(reward, "plif"):
+    use_hard_thresholds = len(enabled) > 1
+    if use_hard_thresholds and "plif" in enabled and _metric_success(reward, "plif"):
         plif_value = _safe_float(reward.get("plif_tanimoto"))
         if plif_value is None or plif_value < config.plif_min_threshold:
             reasons.append("plif_below_threshold")
             threshold_failed = True
-    if "strain" in enabled and _metric_success(reward, "strain") and config.strain_max_threshold != math.inf:
+    if use_hard_thresholds and "strain" in enabled and _metric_success(reward, "strain") and config.strain_max_threshold != math.inf:
         strain_value = _safe_float(reward.get("strain_energy"))
         if strain_value is None or strain_value > config.strain_max_threshold:
             reasons.append("strain_above_threshold")
             threshold_failed = True
-    if "vina" in enabled and _metric_success(reward, "vina") and config.vina_max_threshold != math.inf:
+    if use_hard_thresholds and "vina" in enabled and _metric_success(reward, "vina") and config.vina_max_threshold != math.inf:
         vina_value = _safe_float(reward.get("vina_score"))
         if vina_value is None or vina_value > config.vina_max_threshold:
             reasons.append("vina_above_threshold")

@@ -102,6 +102,26 @@ def build_model(
         "precision": get_precision(args),
         "architecture": args.arch,
         **dm.hparams,
+        # Default-off reward-guided fine-tuning args.  These are saved as
+        # hparams but do not affect baseline training unless explicitly enabled.
+        "enable_rl_finetune": args.enable_rl_finetune,
+        "rl_loss_weight": args.rl_loss_weight,
+        "rl_objective_mode": args.rl_objective_mode,
+        "rl_multiobjective_strategy": args.rl_multiobjective_strategy,
+        "rl_plif_weight": args.rl_plif_weight,
+        "rl_strain_weight": args.rl_strain_weight,
+        "rl_vina_weight": args.rl_vina_weight,
+        "rl_plif_min_threshold": args.rl_plif_min_threshold,
+        "rl_strain_max_threshold": args.rl_strain_max_threshold,
+        "rl_vina_max_threshold": args.rl_vina_max_threshold,
+        "rl_strain_good_threshold": args.rl_strain_good_threshold,
+        "rl_strain_bad_threshold": args.rl_strain_bad_threshold,
+        "rl_vina_good_threshold": args.rl_vina_good_threshold,
+        "rl_vina_bad_threshold": args.rl_vina_bad_threshold,
+        "rl_top_ratio": args.rl_top_ratio,
+        "rl_bottom_ratio": args.rl_bottom_ratio,
+        "rl_metric_source": args.rl_metric_source,
+        "rl_metric_cache_path": args.rl_metric_cache_path,
     }
 
     # Add 1 for the time (0 <= t <= 1 for flow matching) and potentially 1 for the atom type whether ligand or pocket
@@ -899,6 +919,49 @@ if __name__ == "__main__":
         default=DEFAULT_INTERACTION_LOSS_WEIGHT,
     )
     parser.add_argument("--use_t_loss_weights", action="store_true")
+
+    # Default-off reward-guided fine-tuning args
+    parser.add_argument("--enable_rl_finetune", action="store_true")
+    parser.add_argument("--rl_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--rl_objective_mode",
+        type=str,
+        default="strain",
+        choices=[
+            "plif",
+            "strain",
+            "vina",
+            "plif_strain",
+            "plif_vina",
+            "strain_vina",
+            "plif_strain_vina",
+        ],
+    )
+    parser.add_argument(
+        "--rl_multiobjective_strategy",
+        type=str,
+        default="constrained_weighted_sum",
+        choices=["constrained_weighted_sum"],
+    )
+    parser.add_argument("--rl_plif_weight", type=float, default=1.0)
+    parser.add_argument("--rl_strain_weight", type=float, default=1.0)
+    parser.add_argument("--rl_vina_weight", type=float, default=1.0)
+    parser.add_argument("--rl_plif_min_threshold", type=float, default=0.3)
+    parser.add_argument("--rl_strain_max_threshold", type=float, default=10.0)
+    parser.add_argument("--rl_vina_max_threshold", type=float, default=-6.0)
+    parser.add_argument("--rl_strain_good_threshold", type=float, default=0.0)
+    parser.add_argument("--rl_strain_bad_threshold", type=float, default=20.0)
+    parser.add_argument("--rl_vina_good_threshold", type=float, default=-10.0)
+    parser.add_argument("--rl_vina_bad_threshold", type=float, default=0.0)
+    parser.add_argument("--rl_top_ratio", type=float, default=0.1)
+    parser.add_argument("--rl_bottom_ratio", type=float, default=0.1)
+    parser.add_argument(
+        "--rl_metric_source",
+        type=str,
+        default="compute",
+        choices=["compute", "cached", "existing_eval_output"],
+    )
+    parser.add_argument("--rl_metric_cache_path", type=str, default=None)
     parser.add_argument(
         "--categorical_strategy", type=str, default=DEFAULT_CATEGORICAL_STRATEGY
     )
