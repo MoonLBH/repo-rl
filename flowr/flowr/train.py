@@ -102,6 +102,67 @@ def build_model(
         "precision": get_precision(args),
         "architecture": args.arch,
         **dm.hparams,
+        # Default-off reward-guided fine-tuning args.  These are saved as
+        # hparams but do not affect baseline training unless explicitly enabled.
+        "enable_rl_finetune": args.enable_rl_finetune,
+        "rl_loss_weight": args.rl_loss_weight,
+        "rl_objective_mode": args.rl_objective_mode,
+        "rl_multiobjective_strategy": args.rl_multiobjective_strategy,
+        "rl_plif_weight": args.rl_plif_weight,
+        "rl_strain_weight": args.rl_strain_weight,
+        "rl_vina_weight": args.rl_vina_weight,
+        "rl_plif_min_threshold": args.rl_plif_min_threshold,
+        "rl_strain_max_threshold": args.rl_strain_max_threshold,
+        "rl_vina_max_threshold": args.rl_vina_max_threshold,
+        "rl_strain_good_threshold": args.rl_strain_good_threshold,
+        "rl_strain_bad_threshold": args.rl_strain_bad_threshold,
+        "rl_vina_good_threshold": args.rl_vina_good_threshold,
+        "rl_vina_bad_threshold": args.rl_vina_bad_threshold,
+        "rl_update_frequency": args.rl_update_frequency,
+        "rl_sampling_steps": args.rl_sampling_steps,
+        "rl_num_candidates_per_step": args.rl_num_candidates_per_step,
+        "rl_sample_from_reference": args.rl_sample_from_reference,
+        "rl_use_reference_model": args.rl_use_reference_model,
+        "rl_ref_ema_decay": args.rl_ref_ema_decay,
+        "rl_reference_checkpoint": args.rl_reference_checkpoint,
+        "rl_surrogate_type": args.rl_surrogate_type,
+        "rl_num_stratified_timesteps": args.rl_num_stratified_timesteps,
+        "rl_top_ratio": args.rl_top_ratio,
+        "rl_bottom_ratio": args.rl_bottom_ratio,
+        "rl_top_k": args.rl_top_k,
+        "rl_bottom_k": args.rl_bottom_k,
+        "rl_middle_weight": args.rl_middle_weight,
+        "rl_bottom_repulsion_weight": args.rl_bottom_repulsion_weight,
+        "rl_top_atom_weight": args.rl_top_atom_weight,
+        "rl_top_bond_weight": args.rl_top_bond_weight,
+        "rl_top_charge_weight": args.rl_top_charge_weight,
+        "rl_top_coord_weight": args.rl_top_coord_weight,
+        "rl_bottom_atom_weight": args.rl_bottom_atom_weight,
+        "rl_bottom_bond_weight": args.rl_bottom_bond_weight,
+        "rl_bottom_charge_weight": args.rl_bottom_charge_weight,
+        "rl_bottom_coord_weight": args.rl_bottom_coord_weight,
+        "rl_beta_atom": args.rl_beta_atom,
+        "rl_beta_bond": args.rl_beta_bond,
+        "rl_beta_charge": args.rl_beta_charge,
+        "rl_gamma_coord": args.rl_gamma_coord,
+        "rl_aux_fm_weight": args.rl_aux_fm_weight,
+        "rl_anchor_weight": args.rl_anchor_weight,
+        "rl_detach_targets": args.rl_detach_targets,
+        "rl_detach_reward": args.rl_detach_reward,
+        "rl_metric_source": args.rl_metric_source,
+        "rl_metric_cache_path": args.rl_metric_cache_path,
+        "rl_compute_plif_every_n_steps": args.rl_compute_plif_every_n_steps,
+        "rl_compute_vina_every_n_steps": args.rl_compute_vina_every_n_steps,
+        "rl_compute_strain_every_n_steps": args.rl_compute_strain_every_n_steps,
+        "rl_max_metric_failures_per_batch": args.rl_max_metric_failures_per_batch,
+        "rl_skip_expensive_metrics_in_warmup": args.rl_skip_expensive_metrics_in_warmup,
+        "rl_warmup_steps": args.rl_warmup_steps,
+        "rl_invalid_reward": args.rl_invalid_reward,
+        "rl_metric_failed_reward": args.rl_metric_failed_reward,
+        "rl_failed_as_bottom": args.rl_failed_as_bottom,
+        "rl_log_selected_samples": args.rl_log_selected_samples,
+        "rl_save_selected_samples": args.rl_save_selected_samples,
+        "rl_log_metric_failures": args.rl_log_metric_failures,
     }
 
     # Add 1 for the time (0 <= t <= 1 for flow matching) and potentially 1 for the atom type whether ligand or pocket
@@ -899,6 +960,90 @@ if __name__ == "__main__":
         default=DEFAULT_INTERACTION_LOSS_WEIGHT,
     )
     parser.add_argument("--use_t_loss_weights", action="store_true")
+
+    # Default-off reward-guided fine-tuning args
+    parser.add_argument("--enable_rl_finetune", action="store_true")
+    parser.add_argument("--rl_loss_weight", type=float, default=0.0)
+    parser.add_argument(
+        "--rl_objective_mode",
+        type=str,
+        default="strain",
+        choices=[
+            "plif",
+            "strain",
+            "vina",
+            "plif_strain",
+            "plif_vina",
+            "strain_vina",
+            "plif_strain_vina",
+        ],
+    )
+    parser.add_argument(
+        "--rl_multiobjective_strategy",
+        type=str,
+        default="constrained_weighted_sum",
+        choices=["constrained_weighted_sum"],
+    )
+    parser.add_argument("--rl_plif_weight", type=float, default=1.0)
+    parser.add_argument("--rl_strain_weight", type=float, default=1.0)
+    parser.add_argument("--rl_vina_weight", type=float, default=1.0)
+    parser.add_argument("--rl_plif_min_threshold", type=float, default=0.3)
+    parser.add_argument("--rl_strain_max_threshold", type=float, default=10.0)
+    parser.add_argument("--rl_vina_max_threshold", type=float, default=-6.0)
+    parser.add_argument("--rl_strain_good_threshold", type=float, default=0.0)
+    parser.add_argument("--rl_strain_bad_threshold", type=float, default=20.0)
+    parser.add_argument("--rl_vina_good_threshold", type=float, default=-10.0)
+    parser.add_argument("--rl_vina_bad_threshold", type=float, default=0.0)
+    parser.add_argument("--rl_update_frequency", type=int, default=1)
+    parser.add_argument("--rl_sampling_steps", type=int, default=100)
+    parser.add_argument("--rl_num_candidates_per_step", type=int, default=1)
+    parser.add_argument("--rl_sample_from_reference", action="store_true")
+    parser.add_argument("--rl_use_reference_model", action="store_true")
+    parser.add_argument("--rl_ref_ema_decay", type=float, default=0.999)
+    parser.add_argument("--rl_reference_checkpoint", type=str, default=None)
+    parser.add_argument("--rl_surrogate_type", type=str, default="top_imitation_bottom_repulsion", choices=["top_imitation_bottom_repulsion"])
+    parser.add_argument("--rl_num_stratified_timesteps", type=int, default=1)
+    parser.add_argument("--rl_top_ratio", type=float, default=0.25)
+    parser.add_argument("--rl_bottom_ratio", type=float, default=0.25)
+    parser.add_argument("--rl_top_k", type=int, default=None)
+    parser.add_argument("--rl_bottom_k", type=int, default=None)
+    parser.add_argument("--rl_middle_weight", type=float, default=0.0)
+    parser.add_argument("--rl_bottom_repulsion_weight", type=float, default=1.0)
+    parser.add_argument("--rl_top_atom_weight", type=float, default=1.0)
+    parser.add_argument("--rl_top_bond_weight", type=float, default=1.0)
+    parser.add_argument("--rl_top_charge_weight", type=float, default=1.0)
+    parser.add_argument("--rl_top_coord_weight", type=float, default=1.0)
+    parser.add_argument("--rl_bottom_atom_weight", type=float, default=1.0)
+    parser.add_argument("--rl_bottom_bond_weight", type=float, default=1.0)
+    parser.add_argument("--rl_bottom_charge_weight", type=float, default=1.0)
+    parser.add_argument("--rl_bottom_coord_weight", type=float, default=1.0)
+    parser.add_argument("--rl_beta_atom", type=float, default=1.0)
+    parser.add_argument("--rl_beta_bond", type=float, default=1.0)
+    parser.add_argument("--rl_beta_charge", type=float, default=1.0)
+    parser.add_argument("--rl_gamma_coord", type=float, default=1.0)
+    parser.add_argument("--rl_aux_fm_weight", type=float, default=0.0)
+    parser.add_argument("--rl_anchor_weight", type=float, default=0.0)
+    parser.add_argument("--rl_detach_targets", action="store_true")
+    parser.add_argument("--rl_detach_reward", action="store_true")
+    parser.add_argument(
+        "--rl_metric_source",
+        type=str,
+        default="compute",
+        choices=["compute", "cached", "existing_eval_output"],
+    )
+    parser.add_argument("--rl_metric_cache_path", type=str, default=None)
+    parser.add_argument("--rl_compute_plif_every_n_steps", type=int, default=1)
+    parser.add_argument("--rl_compute_vina_every_n_steps", type=int, default=1)
+    parser.add_argument("--rl_compute_strain_every_n_steps", type=int, default=1)
+    parser.add_argument("--rl_max_metric_failures_per_batch", type=int, default=None)
+    parser.add_argument("--rl_skip_expensive_metrics_in_warmup", action="store_true")
+    parser.add_argument("--rl_warmup_steps", type=int, default=0)
+    parser.add_argument("--rl_invalid_reward", type=float, default=0.0)
+    parser.add_argument("--rl_metric_failed_reward", type=float, default=0.0)
+    parser.add_argument("--rl_failed_as_bottom", action="store_true")
+    parser.add_argument("--rl_log_selected_samples", action="store_true")
+    parser.add_argument("--rl_save_selected_samples", action="store_true")
+    parser.add_argument("--rl_log_metric_failures", action="store_true")
     parser.add_argument(
         "--categorical_strategy", type=str, default=DEFAULT_CATEGORICAL_STRATEGY
     )
@@ -948,6 +1093,13 @@ if __name__ == "__main__":
         trial_run=False,
         use_ema=True,
         self_condition=True,
+        rl_sample_from_reference=True,
+        rl_use_reference_model=True,
+        rl_detach_targets=True,
+        rl_detach_reward=True,
+        rl_failed_as_bottom=True,
+        rl_log_selected_samples=True,
+        rl_log_metric_failures=True,
     )
 
     args = parser.parse_args()
