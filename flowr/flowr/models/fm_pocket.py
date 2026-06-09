@@ -20,7 +20,7 @@ import flowr.util.metrics as Metrics
 import flowr.util.rdkit as smolRD
 from flowr.data.data_info import GeneralInfos as DataInfos
 from flowr.models.semla import MolecularGenerator
-from flowr.rl.training import maybe_apply_rl_finetune_loss
+from flowr.rl.training import maybe_apply_rl_finetune_loss, on_train_batch_end_update_reference
 from flowr.util.molrepr import GeometricMol
 from flowr.util.tokeniser import Vocabulary
 
@@ -1527,7 +1527,7 @@ class LigandPocketCFM(pl.LightningModule):
 
         losses = self._loss(lig_data, lig_interp, predicted, times=ligand_times)
         loss = sum(list(losses.values()))
-        loss, rl_logs = maybe_apply_rl_finetune_loss(self, loss, lig_data, predicted)
+        loss, rl_logs = maybe_apply_rl_finetune_loss(self, loss, prior, data)
 
         for name, loss_val in losses.items():
             self.log(
@@ -1554,6 +1554,10 @@ class LigandPocketCFM(pl.LightningModule):
         )
 
         return loss
+
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        on_train_batch_end_update_reference(self)
 
     def validation_step(self, batch, b_idx):
         # Input data
