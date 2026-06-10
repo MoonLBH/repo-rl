@@ -1097,7 +1097,141 @@ def build_pseudo_training_batch_from_plan(
         "train-rl-num-stratified-timesteps": float(getattr(model.hparams, "rl_num_stratified_timesteps", 1)),
         "train-rl-pseudo-batch-size": float(len(expanded_labels)),
     }
+    pseudo = normalize_pseudo_batch_tensors(pseudo, model)
     assert len(expanded_labels) == int(pseudo["target"]["coords"].shape[0])
+    return pseudo
+
+
+def ensure_tensor_on_device(value: Any, device: torch.device, dtype: Optional[torch.dtype] = None) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        out = value
+    elif isinstance(value, (list, tuple)):
+        if len(value) == 0:
+            return None
+        if all(torch.is_tensor(v) for v in value):
+            try:
+                out = torch.stack([v.detach() for v in value], dim=0)
+            except RuntimeError:
+                max_len = max(int(v.shape[0]) for v in value)
+                padded = []
+                for v in value:
+                    if max_len > int(v.shape[0]):
+                        pad_shape = (max_len - int(v.shape[0]),) + tuple(v.shape[1:])
+                        pad = torch.zeros(pad_shape, dtype=v.dtype, device=v.device)
+                        padded.append(torch.cat([v, pad], dim=0))
+                    else:
+                        padded.append(v)
+                out = torch.stack([v.detach() for v in padded], dim=0)
+        else:
+            out = torch.as_tensor(value)
+    else:
+        out = torch.as_tensor(value)
+
+    out = out.to(device)
+    if dtype is not None:
+        out = out.to(dtype=dtype)
+    return out
+
+
+def default_fragment_mask_like(mask: torch.Tensor) -> torch.Tensor:
+    # Shape [B, N], all False.  This means no fixed/inpainted ligand atoms.
+    return torch.zeros_like(mask, dtype=torch.bool)
+
+
+def normalize_fragment_mask(value: Any, ligand_mask: torch.Tensor, device: torch.device) -> torch.Tensor:
+    # ligand_mask shape [B, N]
+    if value is None:
+        return default_fragment_mask_like(ligand_mask).to(device)
+
+    fm = ensure_tensor_on_device(value, device)
+    if fm is None:
+        return default_fragment_mask_like(ligand_mask).to(device)
+
+    # Common cases:
+    # [N] -> [1, N]
+    # [B, N] -> [B, N]
+    if fm.dim() == 1:
+        fm = fm.unsqueeze(0)
+
+    # If list stacking produced [B, 1, N], squeeze middle singleton.
+    if fm.dim() == 3 and fm.size(1) == 1:
+        fm = fm[:, 0]
+
+    if fm.dim() != 2:
+        raise RuntimeError(f"fragment_mask must be [B,N] after normalization, got {tuple(fm.shape)}")
+
+    if fm.shape[0] != ligand_mask.shape[0]:
+        if fm.shape[0] == 1 and ligand_mask.shape[0] > 1:
+            fm = fm.expand(ligand_mask.shape[0], -1)
+        else:
+            raise RuntimeError(
+                f"fragment_mask batch mismatch: fragment_mask={tuple(fm.shape)}, "
+                f"ligand_mask={tuple(ligand_mask.shape)}"
+            )
+
+    if fm.shape[1] != ligand_mask.shape[1]:
+        batch_size, n_atoms = ligand_mask.shape
+        out = torch.zeros((batch_size, n_atoms), device=device, dtype=torch.bool)
+        n_copy = min(n_atoms, int(fm.shape[1]))
+        out[:, :n_copy] = fm[:, :n_copy].bool()
+        fm = out
+
+    return fm.bool() & ligand_mask.bool()
+
+
+def normalize_optional_interactions(value: Any, ligand_mask: torch.Tensor, device: torch.device) -> Optional[torch.Tensor]:
+    if value is None:
+        return None
+    out = ensure_tensor_on_device(value, device)
+    return out
+
+
+def normalize_pseudo_batch_tensors(pseudo: dict[str, Any], model: Any) -> dict[str, Any]:
+    device = model.device
+
+    for section in ["target", "interp", "pocket"]:
+        if section not in pseudo or pseudo[section] is None:
+            continue
+        for key, value in list(pseudo[section].items()):
+            if key == "complex" or key in ["labels"]:
+                continue
+            if torch.is_tensor(value):
+                pseudo[section][key] = value.to(device)
+
+    pseudo["target"]["mask"] = ensure_tensor_on_device(pseudo["target"]["mask"], device).bool()
+    pseudo["interp"]["mask"] = ensure_tensor_on_device(pseudo["interp"]["mask"], device).bool()
+
+    # ``fm_pocket.forward`` expects a tensor fragment mask whenever any
+    # inpainting flag is enabled.  RL fine-tuning is not an inpainting task, so
+    # missing or empty fragment masks default to all-False.
+    pseudo["interp"]["fragment_mask"] = normalize_fragment_mask(
+        pseudo["interp"].get("fragment_mask", None),
+        pseudo["interp"]["mask"],
+        device,
+    )
+
+    if "fragment_mask" in pseudo["target"]:
+        pseudo["target"]["fragment_mask"] = normalize_fragment_mask(
+            pseudo["target"].get("fragment_mask", None),
+            pseudo["target"]["mask"],
+            device,
+        )
+
+    if "interactions" in pseudo["interp"]:
+        pseudo["interp"]["interactions"] = normalize_optional_interactions(
+            pseudo["interp"].get("interactions", None),
+            pseudo["interp"]["mask"],
+            device,
+        )
+    if "interactions" in pseudo["target"]:
+        pseudo["target"]["interactions"] = normalize_optional_interactions(
+            pseudo["target"].get("interactions", None),
+            pseudo["target"]["mask"],
+            device,
+        )
+
     return pseudo
 
 
@@ -1299,8 +1433,18 @@ def gather_pocket_for_candidates(model: Any, data: Mapping[str, Any], prior: Map
 
 
 def gather_optional_rows(value: Any, batch_indices: Sequence[int], device: torch.device) -> Any:
+    if value is None:
+        return None
     if torch.is_tensor(value):
         return value[batch_indices].to(device)
+    if isinstance(value, (list, tuple)):
+        selected = [value[int(i)] for i in batch_indices]
+        if all(torch.is_tensor(v) for v in selected):
+            try:
+                return torch.stack([v.to(device) for v in selected], dim=0)
+            except RuntimeError:
+                return selected
+        return selected
     return value
 
 
