@@ -246,3 +246,11 @@ The Spindr wrapper now prints the TensorBoard launch command:
 ```bash
 tensorboard --logdir "$save_dir/tensorboard" --port 6006 --host 0.0.0.0
 ```
+
+## 22. Ref-gen-only reference mechanism update
+
+The RL reference mechanism now mirrors the LIFT implementation more closely: it maintains only an EMA copy of the core FLOWR generator, not a full LightningModule. `ensure_reference_generator(model)` creates `ref_gen = copy.deepcopy(model.gen)`, stores it outside module registration under `model.__dict__["_rl_ref_gen"]`, freezes it, and keeps it in eval mode. The code no longer deep-copies the full LightningModule for reference initialization, avoiding Trainer/DDP thread-lock deepcopy failures.
+
+Reference sampling now selects `sampler_gen = ref_gen` by default, then reuses the current model's builder, metadata handling, integrator settings, molecule conversion, and pocket/system bookkeeping. A small temporary generator context is used around `model._generate(...)` and reference forward calls so only the neural generator is swapped, while the current LightningModule remains responsible for all non-network utilities.
+
+Reference EMA updates now operate directly on `ref_gen.parameters()` and `ref_gen.buffers()` from `model.gen`, then re-freeze the reference generator after each update. The log schema includes `train-rl-reference-type = 1` for the ref-gen-only path and `train-rl-ref-ema-decay` for the EMA decay value.

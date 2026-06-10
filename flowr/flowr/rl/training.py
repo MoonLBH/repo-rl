@@ -8,6 +8,8 @@ reference model, runs ODE sampling, or computes structure rewards unless
 
 from __future__ import annotations
 
+import copy
+from contextlib import contextmanager
 import hashlib
 import json
 import math
@@ -98,14 +100,14 @@ def maybe_apply_rl_finetune_loss(
         return loss, logs
 
     try:
-        ref_model = ensure_reference_model(model)
+        ref_gen = ensure_reference_generator(model)
     except Exception as exc:
         handle_rl_exception(model, "reference_init_failed", exc)
         logs.update(skip_logs("reference_init_failed"))
         return loss, logs
 
     try:
-        candidates = sample_reference_candidates(model, ref_model, prior, data)
+        candidates = sample_reference_candidates(model, ref_gen, prior, data)
         logs.update(candidate_sampling_logs(model))
     except Exception as exc:
         handle_rl_exception(model, "reference_generation_failed", exc)
@@ -134,7 +136,7 @@ def maybe_apply_rl_finetune_loss(
     selection = select_rewards_for_training(model, rewards)
     logs.update(reward_summary_logs(rewards, selection, cache_hit_rate))
     try:
-        surrogate, surrogate_logs = lfpof_v2_surrogate_loss(model, ref_model, prior, data, candidates, rewards, selection)
+        surrogate, surrogate_logs = lfpof_v2_surrogate_loss(model, ref_gen, prior, data, candidates, rewards, selection)
     except RuntimeError as exc:
         if "interpolant" in str(exc).lower():
             reason = "interpolant_error"
@@ -196,13 +198,13 @@ def run_rl_chunkwise_manual_optimization(
         return finish("frequency")
 
     try:
-        ref_model = ensure_reference_model(model)
+        ref_gen = ensure_reference_generator(model)
     except Exception as exc:
         handle_rl_exception(model, "reference_init_failed", exc)
         return finish("reference_init_failed")
 
     try:
-        candidates = sample_reference_candidates(model, ref_model, prior, data)
+        candidates = sample_reference_candidates(model, ref_gen, prior, data)
         logs.update(candidate_sampling_logs(model))
     except Exception as exc:
         handle_rl_exception(model, "reference_generation_failed", exc)
@@ -240,7 +242,7 @@ def run_rl_chunkwise_manual_optimization(
     aggregate = init_chunk_aggregate(model)
     try:
         for chunk in chunks:
-            chunk_loss, chunk_logs = lfpof_v2_surrogate_loss_for_plan(model, ref_model, prior, data, candidates, rewards, selection, chunk, len(full_plan))
+            chunk_loss, chunk_logs = lfpof_v2_surrogate_loss_for_plan(model, ref_gen, prior, data, candidates, rewards, selection, chunk, len(full_plan))
             if chunk_loss is None:
                 continue
             if not torch.isfinite(chunk_loss):
@@ -287,18 +289,21 @@ def step_optimizer_and_scheduler(model: Any, optimizer: Any) -> None:
 def on_train_batch_end_update_reference(model: Any) -> None:
     """EMA-update the explicit RL reference generator after optimizer updates."""
 
-    ref_model = get_reference_model(model)
-    if not rl_enabled(model.hparams) or ref_model is None:
+    ref_gen = get_reference_generator(model)
+    if not rl_enabled(model.hparams) or ref_gen is None:
         return
     decay = float(getattr(model.hparams, "rl_ref_ema_decay", 0.999))
     with torch.no_grad():
-        for ref_param, cur_param in zip(ref_model.gen.parameters(), model.gen.parameters()):
+        for ref_param, cur_param in zip(ref_gen.parameters(), model.gen.parameters()):
             ref_param.data.mul_(decay).add_(cur_param.detach().data, alpha=1.0 - decay)
-        for ref_buffer, cur_buffer in zip(ref_model.gen.buffers(), model.gen.buffers()):
+        for ref_buffer, cur_buffer in zip(ref_gen.buffers(), model.gen.buffers()):
             if ref_buffer.dtype.is_floating_point:
                 ref_buffer.data.mul_(decay).add_(cur_buffer.detach().data, alpha=1.0 - decay)
             else:
                 ref_buffer.data.copy_(cur_buffer.detach().data)
+    ref_gen.eval()
+    for param in ref_gen.parameters():
+        param.requires_grad_(False)
 
 
 def should_run_rl_update(model: Any) -> bool:
@@ -306,61 +311,63 @@ def should_run_rl_update(model: Any) -> bool:
     return int(getattr(model, "global_step", 0)) % freq == 0
 
 
-def ensure_reference_model(model: Any) -> Any:
-    """Return the pre-attached frozen explicit reference generator.
+def get_reference_generator(model: Any) -> Any:
+    return model.__dict__.get("_rl_ref_gen")
 
-    The checkpoint-driven RL entry initializes the reference model before
-    ``trainer.fit`` while the LightningModule is still unmanaged by the
-    Trainer/DDP runtime.  Do not deepcopy the full LightningModule inside
-    ``training_step`` because the Trainer-managed module may contain
-    non-pickleable objects such as thread locks.
+
+def set_reference_generator(model: Any, ref_gen: Any) -> None:
+    remove_registered_reference_generator(model)
+    model.__dict__["_rl_ref_gen"] = ref_gen
+
+
+def remove_registered_reference_generator(model: Any) -> None:
+    modules = getattr(model, "_modules", None)
+    if isinstance(modules, dict) and "_rl_ref_gen" in modules:
+        modules.pop("_rl_ref_gen")
+    model.__dict__.pop("_rl_ref_gen", None)
+
+
+def ensure_reference_generator(model: Any) -> Any:
+    """Create or return the frozen EMA reference generator only.
+
+    This mirrors the LIFT/LFPO-F convention of maintaining
+    ``ref_gen = deepcopy(model.gen)`` and avoids copying the full LightningModule.
     """
 
-    ref_model = get_reference_model(model)
-    if ref_model is None:
-        raise RuntimeError(
-            "RL reference model is not initialized. train_rl_from_smol.py must attach it before trainer.fit()."
-        )
-    ref_model.eval()
-    ref_model.to(model.device)
-    for param in ref_model.parameters():
-        param.requires_grad_(False)
-    ref_model._rl_is_reference_model = True
-    return ref_model
+    ref_gen = get_reference_generator(model)
+    if ref_gen is None:
+        ref_gen = copy.deepcopy(model.gen)
+        ref_gen.eval()
+        ref_gen.to(model.device)
+        for param in ref_gen.parameters():
+            param.requires_grad_(False)
+        set_reference_generator(model, ref_gen)
+        rank0_debug_print(model, "[train-rl] Initialized ref_gen by deepcopy(model.gen)")
+    else:
+        ref_gen.eval()
+        ref_gen.to(model.device)
+        for param in ref_gen.parameters():
+            param.requires_grad_(False)
+    return ref_gen
+
+
+def ensure_reference_model(model: Any) -> Any:
+    """Backward-compatible alias; returns the ref_gen, not a full model."""
+
+    return ensure_reference_generator(model)
 
 
 def get_reference_model(model: Any) -> Any:
-    return model.__dict__.get("_rl_ref_model")
+    return get_reference_generator(model)
 
 
 def set_reference_model(model: Any, ref_model: Any) -> None:
-    remove_registered_reference_module(model)
-    model.__dict__["_rl_ref_model"] = ref_model
+    set_reference_generator(model, ref_model)
 
 
 def remove_registered_reference_module(model: Any) -> None:
-    modules = getattr(model, "_modules", None)
-    if isinstance(modules, dict) and "_rl_ref_model" in modules:
-        modules.pop("_rl_ref_model")
-    model.__dict__.pop("_rl_ref_model", None)
+    remove_registered_reference_generator(model)
 
-
-
-def get_sample_n_molecules_per_target(hparams: Any) -> int:
-    """Return the RL candidate count per pocket/target.
-
-    ``sample_n_molecules_per_target`` follows FLOWR generation semantics.  The
-    older ``rl_num_candidates_per_step`` name is retained only as a backwards
-    compatible alias and is interpreted as the same per-target count.
-    """
-
-    value = getattr(hparams, "sample_n_molecules_per_target", None)
-    if value is None:
-        value = getattr(hparams, "rl_num_candidates_per_step", 1)
-    try:
-        return max(1, int(value))
-    except (TypeError, ValueError):
-        return 1
 
 
 def candidate_sampling_logs(model: Any) -> dict[str, float]:
@@ -370,6 +377,8 @@ def candidate_sampling_logs(model: Any) -> dict[str, float]:
         ),
         "train-rl-num-targets-in-batch": float(getattr(model, "_rl_last_num_targets_in_batch", 0)),
         "train-rl-num-candidates": float(getattr(model, "_rl_last_num_candidates", 0)),
+        "train-rl-reference-type": 1.0,
+        "train-rl-ref-ema-decay": float(getattr(model.hparams, "rl_ref_ema_decay", 0.999)),
     }
 
 def base_logs(model: Any) -> dict[str, Any]:
@@ -382,6 +391,8 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-aux-fm-loss": 0.0,
         "train-rl-anchor-loss": 0.0,
         "train-rl-loss-weight": float(getattr(model.hparams, "rl_loss_weight", 0.0)),
+        "train-rl-reference-type": 1.0,
+        "train-rl-ref-ema-decay": float(getattr(model.hparams, "rl_ref_ema_decay", 0.999)),
         "train-rl-objective-mode": float(OBJECTIVE_MODE_IDS.get(getattr(model.hparams, "rl_objective_mode", "strain"), 0)),
         "train-rl-num-candidates": 0.0,
         "train-rl-sample-n-molecules-per-target": float(get_sample_n_molecules_per_target(model.hparams)),
@@ -457,12 +468,46 @@ def is_multiobjective(objective_mode: str) -> bool:
     return len(OBJECTIVE_METRICS[objective_mode]) > 1
 
 
-def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
+@contextmanager
+def temporarily_use_generator(model: Any, gen: Any):
+    original_gen = model.gen
+    try:
+        model.gen = gen
+        yield
+    finally:
+        model.gen = original_gen
+
+
+def generate_with_generator(
+    model: Any,
+    gen: Any,
+    lig_prior: Mapping[str, Any],
+    pocket_data: Mapping[str, Any],
+    steps: int,
+    times: list[torch.Tensor],
+    strategy: str,
+    corr_iters: int,
+) -> Mapping[str, Any]:
+    """Run FLOWR generation with an explicit generator while reusing model utilities."""
+
+    gen.eval()
+    with torch.no_grad(), temporarily_use_generator(model, gen):
+        return model._generate(
+            lig_prior,
+            pocket_data,
+            steps=steps,
+            times=times,
+            strategy=strategy,
+            corr_iters=corr_iters,
+        )
+
+
+def sample_reference_candidates(model: Any, ref_gen: Any, prior: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Sample complete ligand candidates with FLOWR ODE generation from pi_ref."""
 
     num_rounds = get_sample_n_molecules_per_target(model.hparams)
     sampling_steps = max(1, int(getattr(model.hparams, "rl_sampling_steps", 100)))
-    sampler_model = ref_model if bool(getattr(model.hparams, "rl_sample_from_reference", True)) else model
+    sampler_gen = ref_gen if bool(getattr(model.hparams, "rl_sample_from_reference", True)) else model.gen
     candidates: list[dict[str, Any]] = []
 
     pocket_data = model.builder.extract_pocket_from_complex(data)
@@ -479,22 +524,24 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
     protein_files = write_training_pockets(model, systems, int(lig_prior["mask"].size(0)))
     ref_ligs = [system.ligand.orig_mol.to_rdkit() for system in systems]
 
-    was_training = sampler_model.training
+    was_training = sampler_gen.training
     rank0_debug_print(
         model,
         "[train-rl] reference generation input: "
         f"num_rounds={num_rounds}, sampling_steps={sampling_steps}, "
-        f"sampler_model.training={sampler_model.training}, "
+        f"sampler_gen.training={sampler_gen.training}, "
         f"lig_prior_mask_shape={tensor_shape(lig_prior.get('mask'))}, "
         f"pocket_mask_shape={tensor_shape(pocket_data.get('mask'))}, "
         f"len_systems={len(systems)}, system0_type={type(systems[0]).__name__ if systems else None}",
     )
-    sampler_model.eval()
+    sampler_gen.eval()
     with torch.no_grad():
         for round_idx in range(num_rounds):
-            generated = sampler_model._generate(
-                detach_mapping(lig_prior),
-                detach_mapping(pocket_data),
+            generated = generate_with_generator(
+                model=model,
+                gen=sampler_gen,
+                lig_prior=detach_mapping(lig_prior),
+                pocket_data=detach_mapping(pocket_data),
                 steps=sampling_steps,
                 times=[t.clone() for t in times],
                 strategy=model.sampling_strategy,
@@ -506,7 +553,7 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
                 f"round_idx={round_idx}, generated_keys={sorted(generated.keys())}, "
                 f"generated_mask_shape={tensor_shape(generated.get('mask'))}",
             )
-            mols = sampler_model._generate_mols(generated)
+            mols = model._generate_mols(generated)
             train_targets = generated_to_training_targets(model, generated, systems)
             rank0_debug_print(
                 model,
@@ -533,7 +580,7 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
                     }
                 )
     if was_training:
-        sampler_model.train()
+        sampler_gen.train()
     model._rl_last_num_candidates = len(candidates)
     rank0_debug_print(model, f"[train-rl] reference generation final: len_candidates={len(candidates)}")
     return candidates
@@ -770,7 +817,7 @@ def select_rewards_for_training(model: Any, rewards: Sequence[Mapping[str, Any]]
 
 def lfpof_v2_surrogate_loss(
     model: Any,
-    ref_model: Any,
+    ref_gen: Any,
     prior: Mapping[str, Any],
     data: Mapping[str, Any],
     candidates: Sequence[Mapping[str, Any]],
@@ -785,7 +832,7 @@ def lfpof_v2_surrogate_loss(
     pseudo = build_pseudo_training_batch(model, prior, data, candidates, selected_indices, selected_labels)
     current_pred = forward_ligand_pocket(model, pseudo)
     with torch.no_grad():
-        ref_pred = forward_ligand_pocket(ref_model, pseudo)
+        ref_pred = forward_ligand_pocket_with_generator(model, ref_gen, pseudo)
 
     top_mask, bottom_mask, _ = masks_from_labels(pseudo["labels"], current_pred["coords"].device)
     assert top_mask.shape[0] == current_pred["coords"].shape[0]
@@ -822,7 +869,7 @@ def lfpof_v2_surrogate_loss(
 
 def lfpof_v2_surrogate_loss_for_plan(
     model: Any,
-    ref_model: Any,
+    ref_gen: Any,
     prior: Mapping[str, Any],
     data: Mapping[str, Any],
     candidates: Sequence[Mapping[str, Any]],
@@ -834,7 +881,7 @@ def lfpof_v2_surrogate_loss_for_plan(
     pseudo = build_pseudo_training_batch_from_plan(model, prior, data, candidates, expanded_plan)
     current_pred = forward_ligand_pocket(model, pseudo)
     with torch.no_grad():
-        ref_pred = forward_ligand_pocket(ref_model, pseudo)
+        ref_pred = forward_ligand_pocket_with_generator(model, ref_gen, pseudo)
     top_mask, bottom_mask, _ = masks_from_labels(pseudo["labels"], current_pred["coords"].device)
     assert top_mask.shape[0] == current_pred["coords"].shape[0]
     assert bottom_mask.shape[0] == current_pred["coords"].shape[0]
@@ -1110,6 +1157,12 @@ def forward_ligand_pocket(model: Any, pseudo: Mapping[str, Any]) -> dict[str, to
     if getattr(model, "predict_interactions", False) or getattr(model, "flow_interactions", False):
         predicted["interactions"] = out[4]
     return predicted
+
+
+def forward_ligand_pocket_with_generator(model: Any, gen: Any, pseudo: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    gen.eval()
+    with temporarily_use_generator(model, gen):
+        return forward_ligand_pocket(model, pseudo)
 
 
 def top_imitation_loss(model: Any, target: Mapping[str, torch.Tensor], current: Mapping[str, torch.Tensor], top_mask: torch.Tensor) -> tuple[torch.Tensor, dict[str, Any]]:
