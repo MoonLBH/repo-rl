@@ -1195,16 +1195,39 @@ def target_to_geometric_mol(target: Mapping[str, torch.Tensor], model: Any) -> G
     return GeometricMol(coords, atomics, bond_indices=bond_indices, bond_types=bond_types, charges=charges_out, is_mmap=False)
 
 
-def complex_batch_to_training_dict(batch: PocketComplexBatch, state: str, systems: Sequence[Any], device: torch.device) -> dict[str, Any]:
-    out = batch.to_dict(state=state)
-    out["bonds"] = out.pop("bonds")
-    interactions = batch.interactions(state=state)
-    out["interactions"] = interactions if torch.is_tensor(interactions) else interactions
-    out["fragment_mask"] = batch.fragment_mask()
-    out["complex"] = list(systems)
-    if out.get("charges") is not None and torch.is_tensor(out["charges"]) and out["charges"].dim() == 2:
+def pocket_complex_batch_to_dict_compat(batch: PocketComplexBatch, state: str, systems: Sequence[Any]) -> dict[str, Any]:
+    """Build a FLOWR training dict without relying on ``PocketComplexBatch.to_dict``.
+
+    The current FLOWR ``PocketComplexBatch.to_dict`` calls ``self.bonds(...)``,
+    but this class exposes ``adjacency(...)`` rather than ``bonds(...)``.  The
+    datamodule's complex collation path uses these per-field methods directly;
+    this RL helper mirrors that path locally to avoid patching ``util/pocket.py``
+    or fabricating a global ``bonds`` method with uncertain semantics.
+    """
+
+    charges = batch.charges(state=state).long()
+    if charges is not None and torch.is_tensor(charges) and charges.dim() == 2:
         n_charges = len(smolRD.CHARGE_IDX_MAP.keys())
-        out["charges"] = smolF.one_hot_encode_tensor(out["charges"].long(), n_charges)
+        charges = smolF.one_hot_encode_tensor(charges, n_charges)
+
+    return {
+        "coords": batch.coords(state=state).float(),
+        "atomics": batch.atomics(state=state).float(),
+        "bonds": batch.adjacency(state=state).float(),
+        "interactions": batch.interactions(state=state),
+        "charges": charges,
+        "atom_names": batch.atom_names(state=state).long(),
+        "res_names": batch.res_names(state=state).long(),
+        "lig_mask": batch.lig_mask(state=state).long(),
+        "pocket_mask": batch.pocket_mask(state=state).long(),
+        "fragment_mask": batch.fragment_mask(),
+        "mask": batch.mask.long(),
+        "complex": list(systems),
+    }
+
+
+def complex_batch_to_training_dict(batch: PocketComplexBatch, state: str, systems: Sequence[Any], device: torch.device) -> dict[str, Any]:
+    out = pocket_complex_batch_to_dict_compat(batch, state=state, systems=systems)
     return {key: value.to(device) if torch.is_tensor(value) else value for key, value in out.items()}
 
 
