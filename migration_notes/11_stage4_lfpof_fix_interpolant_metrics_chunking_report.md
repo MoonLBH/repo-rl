@@ -234,6 +234,14 @@ rl_surrogate_chunk_size: int = 0
 - `0`：不主动 chunk，沿用 automatic optimization path；
 - `>0`：启用 manual optimization + true chunk-wise RL backward。
 
+补充修复：expanded plan 现在保存 `(candidate_idx, label, k_id)`，而不是只保存 `(candidate_idx, label)`。因此即使 chunk-wise path 把 expanded samples 切成多个 chunk，每个 expanded sample 仍使用自己的全局 `k_id` 采样时间：
+
+```text
+t ~ U(k_id / K, (k_id + 1) / K)
+```
+
+不会在每个 chunk 内重新从 `0..K-1` 分配 strata。
+
 当 `enable_rl_finetune=true`、`rl_loss_weight>0`、`rl_surrogate_chunk_size>0` 时，模型初始化时设置：
 
 ```python
@@ -290,7 +298,8 @@ rl_surrogate_chunk_size > 0
 新增：
 
 - `--rl_surrogate_chunk_size`，默认 `0`；
-- `--rl_use_original_interpolant`，默认 true；
+- `--rl_use_original_interpolant / --no-rl_use_original_interpolant`，使用 `argparse.BooleanOptionalAction`，默认 true；
+- `--rl_sample_from_reference / --no-rl_sample_from_reference`，使用 `argparse.BooleanOptionalAction`，默认 true，因此默认满足 `z0 ~ pi_ref`；
 - `--rl_allow_simple_corruption_fallback`，默认 false。
 
 保留但当前不用于默认 metric skip：
@@ -410,7 +419,17 @@ python -m flowr.train \
 - `train-rl-num-rl-chunks`；
 - `train-rl-interpolant-mode=1`。
 
-## 18. 当前已验证内容
+## 18. 本轮补充修复
+
+本轮针对 review 进一步修复：
+
+1. `rl_use_original_interpolant` 改为 `BooleanOptionalAction(default=True)`；只有用户显式 `--no-rl_use_original_interpolant` 或设置 `--rl_allow_simple_corruption_fallback` 时才可能走 simple fallback。
+2. `rl_sample_from_reference` 改为 `BooleanOptionalAction(default=True)`，默认从 `pi_ref` 采样。
+3. expanded plan 改为 `(candidate_idx, label, k_id)`，chunk-wise + `K>1` 时每个 sample 使用全局 k_id 所在 strata。
+4. 检查 `structure_rewards.py`：invalid 后直接 return；PoseBusters required 且 failed 后直接 return；因此不会继续算 PLIF / strain / Vina。
+5. reference model 不再作为 child module 注册，EMA 不再 `zip(ref_model.parameters(), model.parameters())`，而是只更新 `gen` 参数/ buffers。
+
+## 19. 当前已验证内容
 
 本阶段已做静态验证：
 
@@ -422,7 +441,7 @@ python -m flowr.train \
    - 默认使用 original interpolant path；
 3. `git diff --check` 通过。
 
-## 19. 当前未验证内容
+## 20. 当前未验证内容
 
 当前环境未实际运行：
 
@@ -433,10 +452,11 @@ python -m flowr.train \
 - interaction-flow 或 inpainting 配置下 pseudo batch 字段完整性；
 - science-level reward improvement。
 
-## 20. 仍可能存在的风险
+## 21. 仍可能存在的风险
 
 1. 原始 FLOWR `ComplexInterpolant` 是 datamodule 层对象，当前通过 `model.rl_train_interpolant = dm.train_interpolant` 挂载；若从非 `flowr.train` 入口构建 model，需要同样挂载。
-2. `rl_surrogate_chunk_size=0` 的 automatic path 仍会一次构建所有 selected expanded samples，可能 OOM；大 batch 建议使用 chunk path。
-3. 原始 interpolant 的 private methods（例如 `_interpolate_mol` / `_match_mols`）被复用，未来 FLOWR upstream 改名会影响 RL helper。
-4. 当前对 inpainting/interaction-flow 不是主要目标路径；若后续使用，需要额外测试。
-5. Manual optimization path 手动 step scheduler；如果使用 epoch-level scheduler，需确认与实验预期一致。
+2. 显式 reference model 现在存放在 `model.__dict__["_rl_ref_model"]`，不会作为 PyTorch child module 注册；EMA 更新只遍历 `ref_model.gen` 与 `model.gen` 的参数/ buffers，避免 reference model 污染 optimizer/checkpoint/parameter iteration。
+3. `rl_surrogate_chunk_size=0` 的 automatic path 仍会一次构建所有 selected expanded samples，可能 OOM；大 batch 建议使用 chunk path。
+4. 原始 interpolant 的 private methods（例如 `_interpolate_mol` / `_match_mols`）被复用，未来 FLOWR upstream 改名会影响 RL helper。
+5. 当前对 inpainting/interaction-flow 不是主要目标路径；若后续使用，需要额外测试。
+6. Manual optimization path 手动 step scheduler；如果使用 epoch-level scheduler，需确认与实验预期一致。

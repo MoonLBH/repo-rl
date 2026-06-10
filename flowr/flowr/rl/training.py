@@ -179,7 +179,7 @@ def run_rl_chunkwise_manual_optimization(
         return finish("pseudo_batch_error")
     chunk_size = max(1, int(getattr(model.hparams, "rl_surrogate_chunk_size", 1)))
     chunks = [full_plan[i : i + chunk_size] for i in range(0, len(full_plan), chunk_size)]
-    logs.update(expanded_count_logs([label for _, label in full_plan], selected_labels))
+    logs.update(expanded_count_logs([label for _, label, _ in full_plan], selected_labels))
     logs["train-rl-num-rl-chunks"] = float(len(chunks))
     logs["train-rl-expanded-selected-count"] = float(len(full_plan))
 
@@ -229,14 +229,14 @@ def step_optimizer_and_scheduler(model: Any, optimizer: Any) -> None:
 def on_train_batch_end_update_reference(model: Any) -> None:
     """EMA-update the explicit RL reference generator after optimizer updates."""
 
-    if not rl_enabled(model.hparams) or not hasattr(model, "_rl_ref_model"):
+    ref_model = get_reference_model(model)
+    if not rl_enabled(model.hparams) or ref_model is None:
         return
-    ref_model = model._rl_ref_model
     decay = float(getattr(model.hparams, "rl_ref_ema_decay", 0.999))
     with torch.no_grad():
-        for ref_param, cur_param in zip(ref_model.parameters(), model.parameters()):
+        for ref_param, cur_param in zip(ref_model.gen.parameters(), model.gen.parameters()):
             ref_param.data.mul_(decay).add_(cur_param.detach().data, alpha=1.0 - decay)
-        for ref_buffer, cur_buffer in zip(ref_model.buffers(), model.buffers()):
+        for ref_buffer, cur_buffer in zip(ref_model.gen.buffers(), model.gen.buffers()):
             if ref_buffer.dtype.is_floating_point:
                 ref_buffer.data.mul_(decay).add_(cur_buffer.detach().data, alpha=1.0 - decay)
             else:
@@ -249,16 +249,20 @@ def should_run_rl_update(model: Any) -> bool:
 
 
 def ensure_reference_model(model: Any) -> Any:
-    """Create a frozen explicit reference generator on first enabled RL step."""
+    """Create a frozen explicit reference generator on first enabled RL step.
 
-    if hasattr(model, "_rl_ref_model"):
-        return model._rl_ref_model
-    old_ref = getattr(model, "_rl_ref_model", None)
-    if hasattr(model, "_rl_ref_model"):
-        delattr(model, "_rl_ref_model")
+    The reference model is intentionally stored in ``model.__dict__`` instead of
+    assigned as a normal ``nn.Module`` attribute.  This avoids registering the
+    reference generator as a child module of the trainable LightningModule, which
+    would otherwise pollute parameter iteration, optimizer state, and checkpoints.
+    """
+
+    ref_model = get_reference_model(model)
+    if ref_model is not None:
+        return ref_model
+    remove_registered_reference_module(model)
     ref_model = copy.deepcopy(model)
-    if old_ref is not None:
-        model._rl_ref_model = old_ref
+    remove_registered_reference_module(ref_model)
     reference_checkpoint = getattr(model.hparams, "rl_reference_checkpoint", None)
     if reference_checkpoint:
         ckpt = torch.load(reference_checkpoint, map_location=model.device)
@@ -269,8 +273,24 @@ def ensure_reference_model(model: Any) -> Any:
     for param in ref_model.parameters():
         param.requires_grad_(False)
     ref_model._rl_is_reference_model = True
-    model._rl_ref_model = ref_model
+    set_reference_model(model, ref_model)
     return ref_model
+
+
+def get_reference_model(model: Any) -> Any:
+    return model.__dict__.get("_rl_ref_model")
+
+
+def set_reference_model(model: Any, ref_model: Any) -> None:
+    remove_registered_reference_module(model)
+    model.__dict__["_rl_ref_model"] = ref_model
+
+
+def remove_registered_reference_module(model: Any) -> None:
+    modules = getattr(model, "_modules", None)
+    if isinstance(modules, dict) and "_rl_ref_model" in modules:
+        modules.pop("_rl_ref_model")
+    model.__dict__.pop("_rl_ref_model", None)
 
 
 def base_logs(model: Any) -> dict[str, Any]:
@@ -701,7 +721,7 @@ def lfpof_v2_surrogate_loss_for_plan(
     candidates: Sequence[Mapping[str, Any]],
     rewards: Sequence[Mapping[str, Any]],
     selection: Mapping[str, Any],
-    expanded_plan: Sequence[tuple[int, str]],
+    expanded_plan: Sequence[tuple[int, str, int]],
     global_expanded_count: int,
 ) -> tuple[Optional[torch.Tensor], dict[str, Any]]:
     pseudo = build_pseudo_training_batch_from_plan(model, prior, data, candidates, expanded_plan)
@@ -782,11 +802,11 @@ def build_pseudo_training_batch(
     return build_pseudo_training_batch_from_plan(model, prior, data, candidates, plan)
 
 
-def expanded_selection_plan(selected_indices: Sequence[int], selected_labels: Sequence[str], k_steps: int) -> list[tuple[int, str]]:
-    expanded: list[tuple[int, str]] = []
+def expanded_selection_plan(selected_indices: Sequence[int], selected_labels: Sequence[str], k_steps: int) -> list[tuple[int, str, int]]:
+    expanded: list[tuple[int, str, int]] = []
     for idx, label in zip(selected_indices, selected_labels):
-        for _ in range(k_steps):
-            expanded.append((int(idx), str(label)))
+        for k_id in range(k_steps):
+            expanded.append((int(idx), str(label), int(k_id)))
     return expanded
 
 
@@ -795,13 +815,15 @@ def build_pseudo_training_batch_from_plan(
     prior: Mapping[str, Any],
     data: Mapping[str, Any],
     candidates: Sequence[Mapping[str, Any]],
-    expanded_plan: Sequence[tuple[int, str]],
+    expanded_plan: Sequence[tuple[int, str, int]],
 ) -> dict[str, Any]:
     if not expanded_plan:
         raise RuntimeError("Cannot build RL pseudo batch without selected expanded samples")
-    expanded_candidates = [candidates[idx] for idx, _ in expanded_plan]
-    expanded_labels = [label for _, label in expanded_plan]
-    times_cont, times_disc = stratified_times(len(expanded_candidates), max(1, int(getattr(model.hparams, "rl_num_stratified_timesteps", 1))), model.device)
+    expanded_candidates = [candidates[idx] for idx, _, _ in expanded_plan]
+    expanded_labels = [label for _, label, _ in expanded_plan]
+    k_ids = [k_id for _, _, k_id in expanded_plan]
+    k_steps = max(1, int(getattr(model.hparams, "rl_num_stratified_timesteps", 1)))
+    times_cont, times_disc = stratified_times_from_k_ids(k_ids, k_steps, model.device)
     mode = "original_interpolant"
     try:
         pseudo = build_pseudo_with_original_interpolant(model, data, expanded_candidates, expanded_labels, times_cont, times_disc)
@@ -928,13 +950,14 @@ def stack_targets(targets: Sequence[Mapping[str, torch.Tensor]], device: torch.d
     }
 
 
-def stratified_times(n_samples: int, k_steps: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+def stratified_times_from_k_ids(k_ids: Sequence[int], k_steps: int, device: torch.device) -> tuple[torch.Tensor, torch.Tensor]:
+    if not k_ids:
+        return torch.empty(0, device=device), torch.empty(0, device=device)
     if k_steps <= 1:
-        times = torch.rand(n_samples, device=device).clamp(1e-3, 0.999)
+        times = torch.rand(len(k_ids), device=device).clamp(1e-3, 0.999)
         return times, times.clone()
-    repeats = math.ceil(n_samples / k_steps)
-    strata = torch.arange(k_steps, device=device).float().repeat(repeats)[:n_samples]
-    times = ((strata + torch.rand(n_samples, device=device)) / float(k_steps)).clamp(1e-3, 0.999)
+    strata = torch.tensor(k_ids, device=device, dtype=torch.float32).clamp(0, k_steps - 1)
+    times = ((strata + torch.rand(len(k_ids), device=device)) / float(k_steps)).clamp(1e-3, 0.999)
     return times, times.clone()
 
 
