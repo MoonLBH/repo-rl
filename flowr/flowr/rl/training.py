@@ -80,6 +80,7 @@ def maybe_apply_rl_finetune_loss(
     try:
         ref_model = ensure_reference_model(model)
         candidates = sample_reference_candidates(model, ref_model, prior, data)
+        logs.update(candidate_sampling_logs(model))
         if not candidates:
             logs.update(skip_logs("no_candidates"))
             return loss, logs
@@ -154,6 +155,7 @@ def run_rl_chunkwise_manual_optimization(
     try:
         ref_model = ensure_reference_model(model)
         candidates = sample_reference_candidates(model, ref_model, prior, data)
+        logs.update(candidate_sampling_logs(model))
     except Exception:
         return finish("reference_generation_failed")
     if not candidates:
@@ -293,6 +295,33 @@ def remove_registered_reference_module(model: Any) -> None:
     model.__dict__.pop("_rl_ref_model", None)
 
 
+
+def get_sample_n_molecules_per_target(hparams: Any) -> int:
+    """Return the RL candidate count per pocket/target.
+
+    ``sample_n_molecules_per_target`` follows FLOWR generation semantics.  The
+    older ``rl_num_candidates_per_step`` name is retained only as a backwards
+    compatible alias and is interpreted as the same per-target count.
+    """
+
+    value = getattr(hparams, "sample_n_molecules_per_target", None)
+    if value is None:
+        value = getattr(hparams, "rl_num_candidates_per_step", 1)
+    try:
+        return max(1, int(value))
+    except (TypeError, ValueError):
+        return 1
+
+
+def candidate_sampling_logs(model: Any) -> dict[str, float]:
+    return {
+        "train-rl-sample-n-molecules-per-target": float(
+            getattr(model, "_rl_last_sample_n_molecules_per_target", get_sample_n_molecules_per_target(model.hparams))
+        ),
+        "train-rl-num-targets-in-batch": float(getattr(model, "_rl_last_num_targets_in_batch", 0)),
+        "train-rl-num-candidates": float(getattr(model, "_rl_last_num_candidates", 0)),
+    }
+
 def base_logs(model: Any) -> dict[str, Any]:
     return {
         "train-rl-enabled": float(rl_enabled(model.hparams)),
@@ -305,6 +334,8 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-loss-weight": float(getattr(model.hparams, "rl_loss_weight", 0.0)),
         "train-rl-objective-mode": float(OBJECTIVE_MODE_IDS.get(getattr(model.hparams, "rl_objective_mode", "strain"), 0)),
         "train-rl-num-candidates": 0.0,
+        "train-rl-sample-n-molecules-per-target": float(get_sample_n_molecules_per_target(model.hparams)),
+        "train-rl-num-targets-in-batch": 0.0,
         "train-rl-num-valid": 0.0,
         "train-rl-num-posebusters-valid": 0.0,
         "train-rl-num-metric-success": 0.0,
@@ -379,7 +410,7 @@ def is_multiobjective(objective_mode: str) -> bool:
 def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, Any], data: Mapping[str, Any]) -> list[dict[str, Any]]:
     """Sample complete ligand candidates with FLOWR ODE generation from pi_ref."""
 
-    num_rounds = max(1, int(getattr(model.hparams, "rl_num_candidates_per_step", 1)))
+    num_rounds = get_sample_n_molecules_per_target(model.hparams)
     sampling_steps = max(1, int(getattr(model.hparams, "rl_sampling_steps", 100)))
     sampler_model = ref_model if bool(getattr(model.hparams, "rl_sample_from_reference", True)) else model
     candidates: list[dict[str, Any]] = []
@@ -390,6 +421,9 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
     lig_prior = model.builder.extract_ligand_from_complex(prior)
     lig_prior["fragment_mask"] = prior.get("fragment_mask")
     lig_prior["interactions"] = prior.get("interactions")
+    num_targets = int(lig_prior["mask"].size(0))
+    model._rl_last_num_targets_in_batch = num_targets
+    model._rl_last_sample_n_molecules_per_target = num_rounds
     times = zero_generation_times(model, prior, pocket_data)
     systems = data.get("complex") or []
     protein_files = write_training_pockets(model, systems, int(lig_prior["mask"].size(0)))
@@ -429,6 +463,7 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
                 )
     if was_training:
         sampler_model.train()
+    model._rl_last_num_candidates = len(candidates)
     return candidates
 
 
