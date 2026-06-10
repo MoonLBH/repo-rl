@@ -559,13 +559,33 @@ def sample_reference_candidates(model: Any, ref_gen: Any, prior: Mapping[str, An
                 model,
                 "[train-rl] reference mol conversion: "
                 f"round_idx={round_idx}, len_mols={len(mols)}, "
+                f"generated_coords_shape={tensor_shape(generated.get('coords'))}, "
+                f"generated_mask_shape={tensor_shape(generated.get('mask'))}, "
+                f"train_targets_coords_shape={tensor_shape(train_targets.get('coords'))}, "
                 f"train_targets_mask_shape={tensor_shape(train_targets.get('mask'))}",
             )
+            if int(getattr(model, "global_step", 0) or 0) < 3:
+                rank0_debug_print(
+                    model,
+                    "[train-rl] reference target shapes: "
+                    f"round_idx={round_idx}, generated_coords_shape={tensor_shape(generated.get('coords'))}, "
+                    f"generated_mask_shape={tensor_shape(generated.get('mask'))}, "
+                    f"train_targets_coords_shape={tensor_shape(train_targets.get('coords'))}, "
+                    f"train_targets_mask_shape={tensor_shape(train_targets.get('mask'))}",
+                )
             batch_size = int(train_targets["mask"].size(0))
             for idx in range(batch_size):
                 system = systems[idx] if idx < len(systems) else None
                 system_id = system.metadata.get("system_id", f"batch_{idx}") if system is not None else f"batch_{idx}"
                 target = slice_ligand_target(train_targets, idx)
+                if int(getattr(model, "global_step", 0) or 0) < 3:
+                    rank0_debug_print(
+                        model,
+                        "[train-rl] candidate target shapes: "
+                        f"round_idx={round_idx}, batch_idx={idx}, "
+                        f"candidate_target_coords_shape={tensor_shape(target.get('coords'))}, "
+                        f"candidate_target_mask_shape={tensor_shape(target.get('mask'))}",
+                    )
                 candidates.append(
                     {
                         "sample_id": f"train_step_{model.global_step}_{round_idx}_{system_id}_{idx}",
@@ -601,24 +621,87 @@ def detach_mapping(mapping: Mapping[str, Any]) -> dict[str, Any]:
     return {key: value.detach().clone() if torch.is_tensor(value) else value for key, value in mapping.items()}
 
 
-def generated_to_training_targets(model: Any, generated: Mapping[str, Any], systems: Sequence[Any]) -> dict[str, torch.Tensor]:
+def normalize_generated_target_shapes(generated: Mapping[str, Any], model: Any) -> dict[str, torch.Tensor]:
+    """Normalize FLOWR generated tensors into clean ligand training targets.
+
+    FLOWR generation may return coordinates as ``[B, C, N, 3]`` where ``C`` is
+    the number of coordinate sets.  The RL pseudo-target path operates on one
+    generated conformer per candidate, so the clean training-target shape must
+    be ``[B, N, 3]`` with a matching ``[B, N]`` ligand mask.
+    """
+
     coords = generated["coords"].clone().to(model.device)
     mask = generated["mask"].clone().to(model.device)
+
+    if coords.dim() == 4:
+        if coords.size(1) != 1 and int(getattr(model, "global_rank", 0) or 0) == 0:
+            print(
+                f"[train-rl] Warning: generated coords has multiple coord sets {tuple(coords.shape)}; "
+                "using coord set 0",
+                flush=True,
+            )
+        coords = coords[:, 0]
+
+    if coords.dim() != 3:
+        raise RuntimeError(f"Expected generated coords [B,N,3] after normalization, got {tuple(coords.shape)}")
+    if mask.dim() != 2:
+        raise RuntimeError(f"Expected generated mask [B,N], got {tuple(mask.shape)}")
+    if coords.shape[0] != mask.shape[0] or coords.shape[1] != mask.shape[1]:
+        raise RuntimeError(
+            "Generated coords/mask shape mismatch after normalization: "
+            f"coords={tuple(coords.shape)}, mask={tuple(mask.shape)}"
+        )
+
+    atomics = generated["atomics"].clone().to(model.device)
+    bonds = generated["bonds"].clone().to(model.device)
+    charges = generated["charges"].clone().to(model.device)
+
+    return {
+        "coords": coords,
+        "atomics": atomics,
+        "bonds": bonds,
+        "charges": charges,
+        "mask": mask,
+    }
+
+
+def generated_to_training_targets(model: Any, generated: Mapping[str, Any], systems: Sequence[Any]) -> dict[str, torch.Tensor]:
+    target = normalize_generated_target_shapes(generated, model)
+    coords = target["coords"]
+    mask = target["mask"]
     if systems:
         com = torch.stack([system.com.to(model.device) for system in systems])
         coords = coords - com[:, None, :]
     coords = coords / float(model.hparams.coord_scale)
     return {
         "coords": coords.detach(),
-        "atomics": generated["atomics"].clone().to(model.device).detach(),
-        "bonds": generated["bonds"].clone().to(model.device).detach(),
-        "charges": generated["charges"].clone().to(model.device).detach(),
+        "atomics": target["atomics"].detach(),
+        "bonds": target["bonds"].detach(),
+        "charges": target["charges"].detach(),
         "mask": mask.detach(),
     }
 
 
 def slice_ligand_target(targets: Mapping[str, torch.Tensor], idx: int) -> dict[str, torch.Tensor]:
-    return {key: value[idx].detach().clone() for key, value in targets.items()}
+    out: dict[str, torch.Tensor] = {}
+    for key, value in targets.items():
+        item = value[idx].detach().clone()
+        if key == "coords" and item.dim() == 3 and item.size(0) == 1:
+            item = item[0]
+        if key == "mask" and item.dim() == 2 and item.size(0) == 1:
+            item = item[0]
+        out[key] = item
+
+    if out["coords"].dim() != 2:
+        raise RuntimeError(f"Candidate coords must be [N,3], got {tuple(out['coords'].shape)}")
+    if out["mask"].dim() != 1:
+        raise RuntimeError(f"Candidate mask must be [N], got {tuple(out['mask'].shape)}")
+    if out["coords"].shape[0] != out["mask"].shape[0]:
+        raise RuntimeError(
+            f"Candidate coords/mask mismatch: coords={tuple(out['coords'].shape)}, "
+            f"mask={tuple(out['mask'].shape)}"
+        )
+    return out
 
 
 def write_training_pockets(model: Any, systems: Sequence[Any], batch_size: int) -> list[Optional[str]]:
@@ -1054,11 +1137,35 @@ def inactive_or_existing_interactions(base_system: Any, ligand: GeometricMol) ->
 
 
 def target_to_geometric_mol(target: Mapping[str, torch.Tensor], model: Any) -> GeometricMol:
-    mask = target["mask"].bool().detach().cpu()
-    coords = target["coords"].detach().cpu()[mask]
-    atomics = target["atomics"].detach().cpu()[mask]
-    charges = target["charges"].detach().cpu()[mask] if "charges" in target else None
-    bonds = target["bonds"].detach().cpu()[mask][:, mask]
+    coords = target["coords"].detach().cpu()
+    mask = target["mask"].detach().cpu().bool()
+
+    if coords.dim() == 3 and coords.size(0) == 1:
+        coords = coords[0]
+    if mask.dim() == 2 and mask.size(0) == 1:
+        mask = mask[0]
+
+    if coords.dim() != 2:
+        raise RuntimeError(f"target_to_geometric_mol expects coords [N,3], got {tuple(coords.shape)}")
+    if mask.dim() != 1:
+        raise RuntimeError(f"target_to_geometric_mol expects mask [N], got {tuple(mask.shape)}")
+    if coords.shape[0] != mask.shape[0]:
+        raise RuntimeError(f"coords/mask mismatch: coords={tuple(coords.shape)}, mask={tuple(mask.shape)}")
+
+    atomics = target["atomics"].detach().cpu()
+    charges = target["charges"].detach().cpu() if "charges" in target else None
+    bonds = target["bonds"].detach().cpu()
+    if atomics.dim() == 3 and atomics.size(0) == 1:
+        atomics = atomics[0]
+    if charges is not None and charges.dim() == 3 and charges.size(0) == 1:
+        charges = charges[0]
+    if bonds.dim() == 4 and bonds.size(0) == 1:
+        bonds = bonds[0]
+
+    coords = coords[mask]
+    atomics = atomics[mask]
+    charges = charges[mask] if charges is not None else None
+    bonds = bonds[mask][:, mask]
     n_atoms = int(mask.sum().item())
     bond_indices = torch.ones((n_atoms, n_atoms), dtype=torch.long).nonzero()
     bond_types = bonds[bond_indices[:, 0], bond_indices[:, 1]]
