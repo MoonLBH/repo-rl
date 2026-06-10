@@ -215,3 +215,34 @@ The dedicated script can load a pretrained model and build a datamodule, but the
 - The checkpoint hparams schema may differ between older FLOWR checkpoints; the loader uses robust defaults, but unusual checkpoints may need an explicit compatibility shim.
 - `generate_from_smol.load_model` currently mutates selected hparams for sampling/inpainting; because this script feeds checkpoint-derived values into those fields, behavior should align with checkpoint defaults, but future changes to the generation loader should be reviewed for RL fine-tuning compatibility.
 - The new CLI deliberately hides architecture flags. If a checkpoint is incompatible with current code, users must fix the checkpoint/code compatibility rather than override architecture flags manually.
+
+## 21. TensorBoard-only logging update for RL entry
+
+The checkpoint-driven RL entry now builds its own trainer instead of calling the generic `flowr.train.build_trainer(...)`. This is intentional because the generic trainer always initializes MLflow and may also initialize WandB. RL smoke tests should not depend on an MLflow backend or WandB setup.
+
+The dedicated function `build_rl_trainer(args, model)` uses only `lightning.pytorch.loggers.TensorBoardLogger` with:
+
+```python
+tb_logger = TensorBoardLogger(
+    save_dir=str(Path(args.save_dir) / "tensorboard"),
+    name=args.exp_name or "rl_finetune",
+    default_hp_metric=False,
+)
+```
+
+The RL entry prints:
+
+```text
+[RL fine-tune] Logger: TensorBoard only
+[RL fine-tune] TensorBoard log dir: <save_dir>/tensorboard
+```
+
+Checkpoint files are saved under `<save_dir>/checkpoints`, with `save_last=True` and epoch checkpoints enabled. The ordinary `flowr.train` logger behavior is unchanged; this TensorBoard-only policy applies only to `flowr.train_rl_from_smol`.
+
+When chunk-wise manual RL is active (`enable_rl_finetune=true`, `rl_loss_weight>0`, and `rl_surrogate_chunk_size>0`), the trainer disables automatic gradient clipping by setting trainer `gradient_clip_val=0.0`; manual optimization continues to use the explicit clipping inside `flowr.rl.training.step_optimizer_and_scheduler(...)`.
+
+The Spindr wrapper now prints the TensorBoard launch command:
+
+```bash
+tensorboard --logdir "$save_dir/tensorboard" --port 6006 --host 0.0.0.0
+```

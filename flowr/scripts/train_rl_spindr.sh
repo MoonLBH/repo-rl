@@ -23,6 +23,9 @@ rl_loss_weight="${RL_LOSS_WEIGHT:-0.01}"
 
 mkdir -p "$save_dir/rl_cache"
 
+echo "[RL fine-tune] TensorBoard command:"
+echo "tensorboard --logdir \"$save_dir/tensorboard\" --port 6006 --host 0.0.0.0"
+
 CUDA_VISIBLE_DEVICES="$cuda_devices" python -m flowr.train_rl_from_smol \
     --ckpt_path "$ckpt" \
     --data_path "$data_path" \

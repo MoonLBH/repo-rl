@@ -94,8 +94,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--acc_batches", type=int, default=DEFAULT_ACC_BATCHES)
     parser.add_argument("--seed", type=int, default=1)
     parser.add_argument("--trial_run", action="store_true")
-    parser.add_argument("--wandb", action="store_true")
-    parser.add_argument("--use_ema", action="store_true", help="Optional original FLOWR EMA callback; independent from RL pi_ref EMA.")
+    parser.add_argument("--use_ema", action="store_true", help="Ignored in this RL entry; the explicit RL reference model has its own EMA.")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--n_validation_mols", type=int, default=DEFAULT_N_VALIDATION_MOLS)
 
@@ -290,23 +289,90 @@ def make_datamodule_args(args: argparse.Namespace, hparams: Mapping[str, Any]) -
     )
 
 
-def make_trainer_args(args: argparse.Namespace) -> argparse.Namespace:
-    return argparse.Namespace(
-        trial_run=args.trial_run,
-        epochs=args.epochs,
-        dataset=args.dataset,
-        exp_name=args.exp_name,
-        save_dir=args.save_dir,
-        wandb=args.wandb,
-        use_ema=args.use_ema,
-        ema_decay=args.ema_decay,
-        val_check_epochs=args.val_check_epochs,
-        gpus=args.gpus,
-        acc_batches=args.acc_batches,
-        gradient_clip_val=args.gradient_clip_val,
-        seed=args.seed,
+def manual_rl_enabled(args: argparse.Namespace) -> bool:
+    return bool(args.enable_rl_finetune) and float(args.rl_loss_weight) > 0.0 and int(args.rl_surrogate_chunk_size or 0) > 0
+
+
+def build_rl_trainer(args: argparse.Namespace, model: Any):
+    """Build a TensorBoard-only trainer for checkpoint-driven RL fine-tuning.
+
+    This intentionally avoids ``flowr.train.build_trainer`` because the generic
+    trainer initializes external experiment loggers. RL smoke tests should depend
+    only on local TensorBoard event files.
+    """
+
+    import datetime
+
+    import lightning.pytorch as pl
+    from lightning.pytorch.callbacks import (
+        LearningRateMonitor,
+        ModelCheckpoint,
+        ModelSummary,
+        TQDMProgressBar,
+    )
+    from lightning.pytorch.loggers import TensorBoardLogger
+    from lightning.pytorch.plugins.environments import LightningEnvironment
+    from lightning.pytorch.strategies import DDPStrategy
+
+    if args.use_ema:
+        warnings.warn(
+            "--use_ema is ignored in train_rl_from_smol.py; the explicit RL reference model uses rl_ref_ema_decay.",
+            stacklevel=2,
+        )
+
+    epochs = 1 if args.trial_run else args.epochs
+    exp_name = args.exp_name or "rl_finetune"
+    tensorboard_dir = Path(args.save_dir) / "tensorboard"
+    checkpoint_dir = Path(args.save_dir) / "checkpoints"
+    tensorboard_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    tb_logger = TensorBoardLogger(
+        save_dir=str(tensorboard_dir),
+        name=exp_name,
+        default_hp_metric=False,
+    )
+    print("[RL fine-tune] Logger: TensorBoard only")
+    print(f"[RL fine-tune] TensorBoard log dir: {tensorboard_dir}")
+
+    ckpt_callback = ModelCheckpoint(
+        dirpath=str(checkpoint_dir),
+        filename="{epoch:03d}-{step}",
+        save_top_k=-1,
+        every_n_epochs=1,
+        save_last=True,
+    )
+    callbacks = [
+        LearningRateMonitor(logging_interval="step"),
+        TQDMProgressBar(refresh_rate=5),
+        ModelSummary(max_depth=2),
+        ckpt_callback,
+    ]
+
+    trainer_gradient_clip_val = float(args.gradient_clip_val or 0.0)
+    if manual_rl_enabled(args):
+        trainer_gradient_clip_val = 0.0
+
+    strategy = DDPStrategy(timeout=datetime.timedelta(seconds=1800 * max(1, args.gpus)))
+    trainer = pl.Trainer(
+        accelerator="gpu" if args.gpus else "cpu",
+        devices=args.gpus if args.gpus else 1,
+        strategy=strategy,
+        plugins=LightningEnvironment(),
+        num_nodes=1,
+        enable_checkpointing=True,
+        accumulate_grad_batches=args.acc_batches,
+        check_val_every_n_epoch=1 if args.trial_run else args.val_check_epochs,
+        gradient_clip_val=trainer_gradient_clip_val,
+        callbacks=callbacks,
+        logger=tb_logger,
+        precision="32",
+        max_epochs=epochs,
+        use_distributed_sampler=True,
     )
 
+    pl.seed_everything(seed=args.seed, workers=args.gpus > 1)
+    return trainer
 
 def set_hparam(model: Any, key: str, value: Any) -> None:
     try:
@@ -411,7 +477,7 @@ def main() -> None:
 
     from flowr.data.data_info import GeneralInfos as DataInfos
     from flowr.gen.generate_from_smol import load_model as load_smol_model
-    from flowr.train import build_data_statistic, build_dm, build_trainer
+    from flowr.train import build_data_statistic, build_dm
 
     hparams = checkpoint_hparams(args.ckpt_path)
     print_checkpoint_summary(hparams, args.ckpt_path)
@@ -442,7 +508,7 @@ def main() -> None:
         f"sample_from_reference={model.hparams.rl_sample_from_reference}"
     )
 
-    trainer = build_trainer(make_trainer_args(args), model=model)
+    trainer = build_rl_trainer(args, model=model)
     trainer.fit(model, datamodule=dm, ckpt_path=args.resume_rl_ckpt)
 
 
