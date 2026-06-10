@@ -62,6 +62,10 @@ def rl_debug_raise_exceptions(model: Any) -> bool:
     return bool(getattr(model.hparams, "rl_debug_raise_exceptions", False))
 
 
+def rl_debug_reference_generation(model: Any) -> bool:
+    return bool(getattr(model.hparams, "rl_debug_reference_generation", False))
+
+
 def is_rank0(model: Any) -> bool:
     return int(getattr(model, "global_rank", 0) or 0) == 0
 
@@ -525,15 +529,16 @@ def sample_reference_candidates(model: Any, ref_gen: Any, prior: Mapping[str, An
     ref_ligs = [system.ligand.orig_mol.to_rdkit() for system in systems]
 
     was_training = sampler_gen.training
-    rank0_debug_print(
-        model,
-        "[train-rl] reference generation input: "
-        f"num_rounds={num_rounds}, sampling_steps={sampling_steps}, "
-        f"sampler_gen.training={sampler_gen.training}, "
-        f"lig_prior_mask_shape={tensor_shape(lig_prior.get('mask'))}, "
-        f"pocket_mask_shape={tensor_shape(pocket_data.get('mask'))}, "
-        f"len_systems={len(systems)}, system0_type={type(systems[0]).__name__ if systems else None}",
-    )
+    if rl_debug_reference_generation(model):
+        rank0_debug_print(
+            model,
+            "[train-rl] reference generation input: "
+            f"num_rounds={num_rounds}, sampling_steps={sampling_steps}, "
+            f"sampler_gen.training={sampler_gen.training}, "
+            f"lig_prior_mask_shape={tensor_shape(lig_prior.get('mask'))}, "
+            f"pocket_mask_shape={tensor_shape(pocket_data.get('mask'))}, "
+            f"len_systems={len(systems)}, system0_type={type(systems[0]).__name__ if systems else None}",
+        )
     sampler_gen.eval()
     with torch.no_grad():
         for round_idx in range(num_rounds):
@@ -547,28 +552,21 @@ def sample_reference_candidates(model: Any, ref_gen: Any, prior: Mapping[str, An
                 strategy=model.sampling_strategy,
                 corr_iters=model.corrector_iters,
             )
-            rank0_debug_print(
-                model,
-                "[train-rl] reference generation output: "
-                f"round_idx={round_idx}, generated_keys={sorted(generated.keys())}, "
-                f"generated_mask_shape={tensor_shape(generated.get('mask'))}",
-            )
-            mols = model._generate_mols(generated)
-            train_targets = generated_to_training_targets(model, generated, systems)
-            rank0_debug_print(
-                model,
-                "[train-rl] reference mol conversion: "
-                f"round_idx={round_idx}, len_mols={len(mols)}, "
-                f"generated_coords_shape={tensor_shape(generated.get('coords'))}, "
-                f"generated_mask_shape={tensor_shape(generated.get('mask'))}, "
-                f"train_targets_coords_shape={tensor_shape(train_targets.get('coords'))}, "
-                f"train_targets_mask_shape={tensor_shape(train_targets.get('mask'))}",
-            )
-            if int(getattr(model, "global_step", 0) or 0) < 3:
+            if rl_debug_reference_generation(model):
                 rank0_debug_print(
                     model,
-                    "[train-rl] reference target shapes: "
-                    f"round_idx={round_idx}, generated_coords_shape={tensor_shape(generated.get('coords'))}, "
+                    "[train-rl] reference generation output: "
+                    f"round_idx={round_idx}, generated_keys={sorted(generated.keys())}, "
+                    f"generated_mask_shape={tensor_shape(generated.get('mask'))}",
+                )
+            mols = model._generate_mols(generated)
+            train_targets = generated_to_training_targets(model, generated, systems)
+            if rl_debug_reference_generation(model):
+                rank0_debug_print(
+                    model,
+                    "[train-rl] reference mol conversion: "
+                    f"round_idx={round_idx}, len_mols={len(mols)}, "
+                    f"generated_coords_shape={tensor_shape(generated.get('coords'))}, "
                     f"generated_mask_shape={tensor_shape(generated.get('mask'))}, "
                     f"train_targets_coords_shape={tensor_shape(train_targets.get('coords'))}, "
                     f"train_targets_mask_shape={tensor_shape(train_targets.get('mask'))}",
@@ -578,7 +576,7 @@ def sample_reference_candidates(model: Any, ref_gen: Any, prior: Mapping[str, An
                 system = systems[idx] if idx < len(systems) else None
                 system_id = system.metadata.get("system_id", f"batch_{idx}") if system is not None else f"batch_{idx}"
                 target = slice_ligand_target(train_targets, idx)
-                if int(getattr(model, "global_step", 0) or 0) < 3:
+                if rl_debug_reference_generation(model):
                     rank0_debug_print(
                         model,
                         "[train-rl] candidate target shapes: "
@@ -602,7 +600,8 @@ def sample_reference_candidates(model: Any, ref_gen: Any, prior: Mapping[str, An
     if was_training:
         sampler_gen.train()
     model._rl_last_num_candidates = len(candidates)
-    rank0_debug_print(model, f"[train-rl] reference generation final: len_candidates={len(candidates)}")
+    if rl_debug_reference_generation(model):
+        rank0_debug_print(model, f"[train-rl] reference generation final: len_candidates={len(candidates)}")
     return candidates
 
 
@@ -665,12 +664,25 @@ def normalize_generated_target_shapes(generated: Mapping[str, Any], model: Any) 
     }
 
 
+def system_com_1d(system: Any, device: torch.device) -> torch.Tensor:
+    """Return a system center-of-mass tensor as ``[3]`` for batch broadcasting."""
+
+    com = system.com.to(device)
+    if com.dim() == 2 and com.size(0) == 1:
+        com = com.squeeze(0)
+    if com.dim() != 1 or com.numel() != 3:
+        raise RuntimeError(f"Expected system.com to be [3] or [1,3], got {tuple(com.shape)}")
+    return com
+
+
 def generated_to_training_targets(model: Any, generated: Mapping[str, Any], systems: Sequence[Any]) -> dict[str, torch.Tensor]:
     target = normalize_generated_target_shapes(generated, model)
     coords = target["coords"]
     mask = target["mask"]
     if systems:
-        com = torch.stack([system.com.to(model.device) for system in systems])
+        com = torch.stack([system_com_1d(system, model.device) for system in systems], dim=0)
+        if com.shape[0] != coords.shape[0]:
+            raise RuntimeError(f"COM batch mismatch: com={tuple(com.shape)}, coords={tuple(coords.shape)}")
         coords = coords - com[:, None, :]
     coords = coords / float(model.hparams.coord_scale)
     return {
@@ -1139,11 +1151,18 @@ def inactive_or_existing_interactions(base_system: Any, ligand: GeometricMol) ->
 def target_to_geometric_mol(target: Mapping[str, torch.Tensor], model: Any) -> GeometricMol:
     coords = target["coords"].detach().cpu()
     mask = target["mask"].detach().cpu().bool()
+    atomics = target["atomics"].detach().cpu()
+    bonds = target["bonds"].detach().cpu()
+    charges = target.get("charges", None)
 
     if coords.dim() == 3 and coords.size(0) == 1:
         coords = coords[0]
     if mask.dim() == 2 and mask.size(0) == 1:
         mask = mask[0]
+    if atomics.dim() == 3 and atomics.size(0) == 1:
+        atomics = atomics[0]
+    if bonds.dim() == 4 and bonds.size(0) == 1:
+        bonds = bonds[0]
 
     if coords.dim() != 2:
         raise RuntimeError(f"target_to_geometric_mol expects coords [N,3], got {tuple(coords.shape)}")
@@ -1152,24 +1171,28 @@ def target_to_geometric_mol(target: Mapping[str, torch.Tensor], model: Any) -> G
     if coords.shape[0] != mask.shape[0]:
         raise RuntimeError(f"coords/mask mismatch: coords={tuple(coords.shape)}, mask={tuple(mask.shape)}")
 
-    atomics = target["atomics"].detach().cpu()
-    charges = target["charges"].detach().cpu() if "charges" in target else None
-    bonds = target["bonds"].detach().cpu()
-    if atomics.dim() == 3 and atomics.size(0) == 1:
-        atomics = atomics[0]
-    if charges is not None and charges.dim() == 3 and charges.size(0) == 1:
-        charges = charges[0]
-    if bonds.dim() == 4 and bonds.size(0) == 1:
-        bonds = bonds[0]
-
     coords = coords[mask]
     atomics = atomics[mask]
-    charges = charges[mask] if charges is not None else None
     bonds = bonds[mask][:, mask]
+
+    charges_out = None
+    if charges is not None:
+        charges = charges.detach().cpu()
+        if charges.dim() == 3 and charges.size(0) == 1:
+            charges = charges[0]
+        charges = charges[mask]
+
+        if charges.dim() == 2:
+            charges = torch.argmax(charges, dim=-1)
+        elif charges.dim() != 1:
+            raise RuntimeError(f"Expected masked charges [N] or [N,C], got {tuple(charges.shape)}")
+
+        charges_out = charges.long()
+
     n_atoms = int(mask.sum().item())
     bond_indices = torch.ones((n_atoms, n_atoms), dtype=torch.long).nonzero()
     bond_types = bonds[bond_indices[:, 0], bond_indices[:, 1]]
-    return GeometricMol(coords, atomics, bond_indices=bond_indices, bond_types=bond_types, charges=charges, is_mmap=False)
+    return GeometricMol(coords, atomics, bond_indices=bond_indices, bond_types=bond_types, charges=charges_out, is_mmap=False)
 
 
 def complex_batch_to_training_dict(batch: PocketComplexBatch, state: str, systems: Sequence[Any], device: torch.device) -> dict[str, Any]:
