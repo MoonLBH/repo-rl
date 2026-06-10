@@ -8,7 +8,6 @@ reference model, runs ODE sampling, or computes structure rewards unless
 
 from __future__ import annotations
 
-import copy
 import hashlib
 import json
 import math
@@ -308,31 +307,25 @@ def should_run_rl_update(model: Any) -> bool:
 
 
 def ensure_reference_model(model: Any) -> Any:
-    """Create a frozen explicit reference generator on first enabled RL step.
+    """Return the pre-attached frozen explicit reference generator.
 
-    The reference model is intentionally stored in ``model.__dict__`` instead of
-    assigned as a normal ``nn.Module`` attribute.  This avoids registering the
-    reference generator as a child module of the trainable LightningModule, which
-    would otherwise pollute parameter iteration, optimizer state, and checkpoints.
+    The checkpoint-driven RL entry initializes the reference model before
+    ``trainer.fit`` while the LightningModule is still unmanaged by the
+    Trainer/DDP runtime.  Do not deepcopy the full LightningModule inside
+    ``training_step`` because the Trainer-managed module may contain
+    non-pickleable objects such as thread locks.
     """
 
     ref_model = get_reference_model(model)
-    if ref_model is not None:
-        return ref_model
-    remove_registered_reference_module(model)
-    ref_model = copy.deepcopy(model)
-    remove_registered_reference_module(ref_model)
-    reference_checkpoint = getattr(model.hparams, "rl_reference_checkpoint", None)
-    if reference_checkpoint:
-        ckpt = torch.load(reference_checkpoint, map_location=model.device)
-        state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, Mapping) else ckpt
-        ref_model.load_state_dict(state_dict, strict=False)
+    if ref_model is None:
+        raise RuntimeError(
+            "RL reference model is not initialized. train_rl_from_smol.py must attach it before trainer.fit()."
+        )
     ref_model.eval()
     ref_model.to(model.device)
     for param in ref_model.parameters():
         param.requires_grad_(False)
     ref_model._rl_is_reference_model = True
-    set_reference_model(model, ref_model)
     return ref_model
 
 

@@ -10,6 +10,7 @@ tuning controls.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import warnings
 from pathlib import Path
@@ -386,6 +387,27 @@ def set_hparam(model: Any, key: str, value: Any) -> None:
         pass
 
 
+
+def initialize_rl_reference_model(model: Any, args: argparse.Namespace) -> None:
+    if not (args.enable_rl_finetune and float(args.rl_loss_weight) > 0.0):
+        return
+
+    import torch
+    from flowr.rl.training import set_reference_model
+
+    ref_model = copy.deepcopy(model)
+    if args.rl_reference_checkpoint:
+        ckpt = torch.load(args.rl_reference_checkpoint, map_location=model.device)
+        state_dict = ckpt.get("state_dict", ckpt) if isinstance(ckpt, Mapping) else ckpt
+        ref_model.load_state_dict(state_dict, strict=False)
+    ref_model.eval()
+    ref_model.to(model.device)
+    for param in ref_model.parameters():
+        param.requires_grad_(False)
+    ref_model._rl_is_reference_model = True
+    set_reference_model(model, ref_model)
+    print("[RL fine-tune] Initialized frozen RL reference model by deepcopy before trainer.fit")
+
 def apply_finetune_overrides(model: Any, args: argparse.Namespace, sample_count: int) -> None:
     rl_sampling_steps = args.rl_sampling_steps if args.rl_sampling_steps is not None else args.integration_steps
     overrides = {
@@ -487,6 +509,7 @@ def main() -> None:
     load_args = make_checkpoint_model_args(args, hparams)
     model, ckpt_hparams, vocab, vocab_pocket_atoms, vocab_pocket_res = load_smol_model(load_args)
     apply_finetune_overrides(model, args, sample_count)
+    initialize_rl_reference_model(model, args)
     model.train()
 
     dm_args = make_datamodule_args(args, ckpt_hparams)
