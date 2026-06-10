@@ -18,6 +18,10 @@ from typing import Any, Mapping, Optional, Sequence
 import torch
 import torch.nn.functional as F
 
+import flowr.util.functional as smolF
+import flowr.util.rdkit as smolRD
+from flowr.util.molrepr import GeometricMol
+from flowr.util.pocket import PocketComplex, PocketComplexBatch
 from flowr.rl.structure_rewards import OBJECTIVE_METRICS, RewardConfig, compute_structure_rewards_from_records
 from flowr.rl.structure_selection import select_top_middle_bottom
 
@@ -39,6 +43,11 @@ SKIP_REASON_IDS = {
     "frequency": 5,
     "no_candidates": 6,
     "surrogate_error": 7,
+    "all_enabled_metrics_failed": 8,
+    "interpolant_error": 9,
+    "pseudo_batch_error": 10,
+    "reference_generation_failed": 11,
+    "no_bottom_use_top_only": 12,
 }
 
 
@@ -78,6 +87,10 @@ def maybe_apply_rl_finetune_loss(
         if not rewards:
             logs.update(skip_logs("missing_rewards"))
             return loss, logs
+        if enabled_metrics_all_failed(rewards, model.hparams):
+            logs.update(reward_summary_logs(rewards, empty_selection_summary(rewards), cache_hit_rate))
+            logs.update(skip_logs("all_enabled_metrics_failed"))
+            return loss, logs
         selection = select_rewards_for_training(model, rewards)
         logs.update(reward_summary_logs(rewards, selection, cache_hit_rate))
         surrogate, surrogate_logs = lfpof_v2_surrogate_loss(model, ref_model, prior, data, candidates, rewards, selection)
@@ -90,9 +103,127 @@ def maybe_apply_rl_finetune_loss(
             return loss, logs
         logs["train-rl-loss"] = surrogate.detach()
         return loss + float(model.hparams.rl_loss_weight) * surrogate, logs
+    except RuntimeError as exc:
+        if "interpolant" in str(exc).lower():
+            logs.update(skip_logs("interpolant_error"))
+        elif "pseudo" in str(exc).lower():
+            logs.update(skip_logs("pseudo_batch_error"))
+        else:
+            logs.update(skip_logs("surrogate_error"))
+        return loss, logs
     except Exception:
         logs.update(skip_logs("metric_error"))
         return loss, logs
+
+
+
+def rl_chunkwise_manual_enabled(model: Any) -> bool:
+    return rl_enabled(model.hparams) and int(getattr(model.hparams, "rl_surrogate_chunk_size", 0) or 0) > 0
+
+
+def run_rl_chunkwise_manual_optimization(
+    model: Any,
+    original_loss: torch.Tensor,
+    prior: Mapping[str, Any],
+    data: Mapping[str, Any],
+) -> tuple[torch.Tensor, dict[str, Any]]:
+    """Manual-optimization path with true per-chunk RL backward.
+
+    This path is only used when RL is enabled and ``rl_surrogate_chunk_size > 0``.
+    The original FLOWR loss is backpropagated once, then each RL pseudo-batch
+    chunk is built, forwarded, backpropagated, and released independently.
+    """
+
+    logs = base_logs(model)
+    logs["train-rl-manual-optimization-enabled"] = 1.0
+    logs["train-rl-surrogate-chunk-size"] = float(getattr(model.hparams, "rl_surrogate_chunk_size", 0))
+    optimizer = model.optimizers()
+    optimizer.zero_grad()
+    model.manual_backward(original_loss)
+
+    def finish(skip_reason: Optional[str] = None, rl_loss_value: float = 0.0) -> tuple[torch.Tensor, dict[str, Any]]:
+        if skip_reason is not None:
+            logs.update(skip_logs(skip_reason))
+        step_optimizer_and_scheduler(model, optimizer)
+        detached_total = original_loss.detach() + original_loss.detach().new_tensor(float(getattr(model.hparams, "rl_loss_weight", 0.0)) * rl_loss_value)
+        return detached_total, logs
+
+    if not should_run_rl_update(model):
+        return finish("frequency")
+
+    try:
+        ref_model = ensure_reference_model(model)
+        candidates = sample_reference_candidates(model, ref_model, prior, data)
+    except Exception:
+        return finish("reference_generation_failed")
+    if not candidates:
+        return finish("no_candidates")
+
+    try:
+        rewards, cache_hit_rate = get_candidate_rewards(model, candidates)
+    except Exception:
+        return finish("metric_error")
+    if not rewards:
+        return finish("missing_rewards")
+    selection = empty_selection_summary(rewards) if enabled_metrics_all_failed(rewards, model.hparams) else select_rewards_for_training(model, rewards)
+    logs.update(reward_summary_logs(rewards, selection, cache_hit_rate))
+    if enabled_metrics_all_failed(rewards, model.hparams):
+        return finish("all_enabled_metrics_failed")
+    if not selection["top_indices"]:
+        return finish("no_top")
+
+    selected_indices = list(selection["top_indices"]) + list(selection["bottom_indices"])
+    selected_labels = ["top"] * len(selection["top_indices"]) + ["bottom"] * len(selection["bottom_indices"])
+    full_plan = expanded_selection_plan(selected_indices, selected_labels, max(1, int(getattr(model.hparams, "rl_num_stratified_timesteps", 1))))
+    if not full_plan:
+        return finish("pseudo_batch_error")
+    chunk_size = max(1, int(getattr(model.hparams, "rl_surrogate_chunk_size", 1)))
+    chunks = [full_plan[i : i + chunk_size] for i in range(0, len(full_plan), chunk_size)]
+    logs.update(expanded_count_logs([label for _, label in full_plan], selected_labels))
+    logs["train-rl-num-rl-chunks"] = float(len(chunks))
+    logs["train-rl-expanded-selected-count"] = float(len(full_plan))
+
+    rl_weight = float(getattr(model.hparams, "rl_loss_weight", 0.0))
+    total_rl_value = 0.0
+    aggregate = init_chunk_aggregate(model)
+    try:
+        for chunk in chunks:
+            chunk_loss, chunk_logs = lfpof_v2_surrogate_loss_for_plan(model, ref_model, prior, data, candidates, rewards, selection, chunk, len(full_plan))
+            if chunk_loss is None:
+                continue
+            if not torch.isfinite(chunk_loss):
+                return finish("nan_loss", total_rl_value)
+            model.manual_backward(rl_weight * chunk_loss)
+            total_rl_value += float(chunk_loss.detach().cpu())
+            update_chunk_aggregate(aggregate, chunk_logs)
+            del chunk_loss
+    except RuntimeError as exc:
+        if "interpolant" in str(exc).lower():
+            return finish("interpolant_error", total_rl_value)
+        return finish("surrogate_error", total_rl_value)
+    except Exception:
+        return finish("surrogate_error", total_rl_value)
+
+    logs.update(finalize_chunk_aggregate(aggregate, max(1, len(chunks))))
+    logs.update(reward_selection_logs(rewards, selection))
+    logs["train-rl-loss"] = float(total_rl_value)
+    return finish(None, total_rl_value)
+
+
+def step_optimizer_and_scheduler(model: Any, optimizer: Any) -> None:
+    grad_clip = float(getattr(model.hparams, "gradient_clip_val", 0.0) or 0.0)
+    if grad_clip > 0.0:
+        model.clip_gradients(optimizer, gradient_clip_val=grad_clip, gradient_clip_algorithm="norm")
+    optimizer.step()
+    scheduler = model.lr_schedulers()
+    if scheduler is None:
+        return
+    schedulers = scheduler if isinstance(scheduler, (list, tuple)) else [scheduler]
+    for sched in schedulers:
+        try:
+            sched.step()
+        except TypeError:
+            sched.scheduler.step()
 
 
 def on_train_batch_end_update_reference(model: Any) -> None:
@@ -174,6 +305,18 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-skip-count": 0.0,
         "train-rl-skip-reason": 0.0,
         "train-rl-cache-hit-rate": 0.0,
+        "train-rl-num-top-candidates": 0.0,
+        "train-rl-num-bottom-candidates": 0.0,
+        "train-rl-num-top-expanded": 0.0,
+        "train-rl-num-bottom-expanded": 0.0,
+        "train-rl-interpolant-mode": 0.0,
+        "train-rl-num-stratified-timesteps": float(getattr(model.hparams, "rl_num_stratified_timesteps", 1)),
+        "train-rl-pseudo-batch-size": 0.0,
+        "train-rl-surrogate-chunk-size": float(getattr(model.hparams, "rl_surrogate_chunk_size", 0)),
+        "train-rl-num-rl-chunks": 0.0,
+        "train-rl-expanded-selected-count": 0.0,
+        "train-rl-manual-optimization-enabled": 0.0,
+        "train-rl-bottom-branch-used": 0.0,
         "train-rl-delta-atom-abs-mean": 0.0,
         "train-rl-delta-bond-abs-mean": 0.0,
         "train-rl-delta-charge-abs-mean": 0.0,
@@ -320,35 +463,64 @@ def write_training_pockets(model: Any, systems: Sequence[Any], batch_size: int) 
 
 
 def get_candidate_rewards(model: Any, candidates: Sequence[Mapping[str, Any]]) -> tuple[list[dict[str, Any]], float]:
+    """Score candidates with all objective-enabled metrics after validity/PB gating.
+
+    The historical every-n-steps and warmup parameters are intentionally not used
+    here: once an RL update runs, every valid and PoseBusters-valid cache miss is
+    evaluated for every metric enabled by ``rl_objective_mode``. Cache hits and
+    misses are returned in original candidate order so selection indices stay
+    aligned with sampled candidates.
+    """
+
     metric_source = getattr(model.hparams, "rl_metric_source", "compute")
     if metric_source == "existing_eval_output":
         return load_existing_train_rewards(model, len(candidates)), 1.0
 
     records = [candidate_to_reward_record(candidate) for candidate in candidates]
     cache = load_metric_cache(getattr(model.hparams, "rl_metric_cache_path", None)) if metric_source == "cached" else {}
-    rewards: list[dict[str, Any]] = []
+    rewards: list[Optional[dict[str, Any]]] = [None] * len(records)
     hits = 0
-    misses: dict[str, dict[str, Any]] = {}
-    for record in records:
+    misses: list[tuple[int, str, dict[str, Any]]] = []
+    for idx, record in enumerate(records):
         key = train_cache_key(record, model.hparams)
         if key in cache:
-            rewards.append(dict(cache[key]))
+            rewards[idx] = dict(cache[key])
             hits += 1
         else:
-            misses[key] = record
+            misses.append((idx, key, record))
     if misses:
         with torch.no_grad():
-            computed = compute_structure_rewards_from_records(misses.values(), config=reward_config_from_hparams(model.hparams))
-        for key, reward in zip(misses, computed):
+            computed = compute_structure_rewards_from_records(
+                [record for _, _, record in misses],
+                config=reward_config_from_hparams(model.hparams),
+            )
+        for (idx, key, _), reward in zip(misses, computed):
             reward = dict(reward)
             reward["cache_key"] = key
             cache[key] = reward
-            rewards.append(reward)
+            rewards[idx] = reward
         if metric_source == "cached":
             rewrite_metric_cache(getattr(model.hparams, "rl_metric_cache_path", None), cache)
     hit_rate = hits / len(records) if records else 0.0
-    return rewards, hit_rate
+    return [reward if reward is not None else metric_failed_reward(records[idx], model.hparams) for idx, reward in enumerate(rewards)], hit_rate
 
+
+def metric_failed_reward(record: Mapping[str, Any], hparams: Any) -> dict[str, Any]:
+    return {
+        "sample_id": record.get("sample_id", "sample"),
+        "valid": False,
+        "posebusters_valid": False,
+        "plif_success": False,
+        "strain_success": False,
+        "vina_success": False,
+        "metric_success": False,
+        "feasible": False,
+        "eligible_top": False,
+        "eligible_bottom": True,
+        "main_score": float(getattr(hparams, "rl_metric_failed_reward", 0.0)),
+        "error": "metric_failed_missing_result",
+        "metadata": record.get("metadata", {}),
+    }
 
 def candidate_to_reward_record(candidate: Mapping[str, Any]) -> dict[str, Any]:
     return {
@@ -425,6 +597,29 @@ def train_cache_key(record: Mapping[str, Any], hparams: Any) -> str:
     return hashlib.sha1(json.dumps(raw, sort_keys=True).encode()).hexdigest()
 
 
+def enabled_metrics_all_failed(rewards: Sequence[Mapping[str, Any]], hparams: Any) -> bool:
+    enabled = OBJECTIVE_METRICS[getattr(hparams, "rl_objective_mode", "strain")]
+    feasible_seen = False
+    success_seen = False
+    for reward in rewards:
+        if bool(reward.get("valid")) and bool(reward.get("posebusters_valid")):
+            feasible_seen = True
+            if all(bool(reward.get(f"{metric}_success")) for metric in enabled):
+                success_seen = True
+                break
+    return feasible_seen and not success_seen
+
+
+def empty_selection_summary(rewards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
+    n = len(rewards)
+    return {
+        "top_indices": [],
+        "middle_indices": list(range(n)),
+        "bottom_indices": [],
+        "summary": {"num_top": 0, "num_bottom": 0, "num_middle": n, "enabled_metrics": []},
+    }
+
+
 def select_rewards_for_training(model: Any, rewards: Sequence[Mapping[str, Any]]) -> dict[str, Any]:
     multi = is_multiobjective(getattr(model.hparams, "rl_objective_mode", "strain"))
     return select_top_middle_bottom(
@@ -465,8 +660,9 @@ def lfpof_v2_surrogate_loss(
     with torch.no_grad():
         ref_pred = forward_ligand_pocket(ref_model, pseudo)
 
-    top_mask = torch.tensor([label == "top" for label in selected_labels], device=model.device)
-    bottom_mask = torch.tensor([label == "bottom" for label in selected_labels], device=model.device)
+    top_mask, bottom_mask, _ = masks_from_labels(pseudo["labels"], current_pred["coords"].device)
+    assert top_mask.shape[0] == current_pred["coords"].shape[0]
+    assert bottom_mask.shape[0] == current_pred["coords"].shape[0]
     top_loss, top_logs = top_imitation_loss(model, pseudo["target"], current_pred, top_mask)
     bottom_loss, bottom_logs = bottom_repulsion_loss(model, current_pred, ref_pred, pseudo["target"], bottom_mask)
     aux_fm_loss = torch.zeros((), device=model.device)
@@ -477,17 +673,101 @@ def lfpof_v2_surrogate_loss(
     main_loss = top_loss + float(getattr(model.hparams, "rl_bottom_repulsion_weight", 1.0)) * bottom_loss
     total = main_loss + float(getattr(model.hparams, "rl_aux_fm_weight", 0.0)) * aux_fm_loss + float(getattr(model.hparams, "rl_anchor_weight", 0.0)) * anchor_loss
 
+    expanded_counts = expanded_count_logs(pseudo["labels"], selected_labels)
     logs: dict[str, Any] = {
         "train-rl-main-loss": main_loss.detach(),
         "train-rl-top-loss": top_loss.detach(),
         "train-rl-bottom-loss": bottom_loss.detach(),
         "train-rl-aux-fm-loss": aux_fm_loss.detach(),
         "train-rl-anchor-loss": anchor_loss.detach(),
+        "train-rl-bottom-branch-used": float(bool(bottom_mask.any())),
+        **expanded_counts,
+        **pseudo.get("logs", {}),
         **top_logs,
         **bottom_logs,
     }
+    if not bool(bottom_mask.any()):
+        logs.update(skip_logs("no_bottom_use_top_only"))
     logs.update(reward_selection_logs(rewards, selection))
     return total, logs
+
+
+
+def lfpof_v2_surrogate_loss_for_plan(
+    model: Any,
+    ref_model: Any,
+    prior: Mapping[str, Any],
+    data: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    rewards: Sequence[Mapping[str, Any]],
+    selection: Mapping[str, Any],
+    expanded_plan: Sequence[tuple[int, str]],
+    global_expanded_count: int,
+) -> tuple[Optional[torch.Tensor], dict[str, Any]]:
+    pseudo = build_pseudo_training_batch_from_plan(model, prior, data, candidates, expanded_plan)
+    current_pred = forward_ligand_pocket(model, pseudo)
+    with torch.no_grad():
+        ref_pred = forward_ligand_pocket(ref_model, pseudo)
+    top_mask, bottom_mask, _ = masks_from_labels(pseudo["labels"], current_pred["coords"].device)
+    assert top_mask.shape[0] == current_pred["coords"].shape[0]
+    assert bottom_mask.shape[0] == current_pred["coords"].shape[0]
+    if not bool(top_mask.any()) and not bool(bottom_mask.any()):
+        return None, {}
+    top_loss, top_logs = top_imitation_loss(model, pseudo["target"], current_pred, top_mask)
+    bottom_loss, bottom_logs = bottom_repulsion_loss(model, current_pred, ref_pred, pseudo["target"], bottom_mask)
+    aux_fm_loss = torch.zeros((), device=model.device)
+    if float(getattr(model.hparams, "rl_aux_fm_weight", 0.0)) > 0.0:
+        aux_losses = model._loss(pseudo["target"], pseudo["interp"], current_pred)
+        aux_fm_loss = sum(aux_losses.values())
+    anchor_loss = anchor_regularization_loss(current_pred, ref_pred, pseudo["target"]) if float(getattr(model.hparams, "rl_anchor_weight", 0.0)) > 0.0 else torch.zeros((), device=model.device)
+    main_loss = top_loss + float(getattr(model.hparams, "rl_bottom_repulsion_weight", 1.0)) * bottom_loss
+    total = main_loss + float(getattr(model.hparams, "rl_aux_fm_weight", 0.0)) * aux_fm_loss + float(getattr(model.hparams, "rl_anchor_weight", 0.0)) * anchor_loss
+    scale = float(len(expanded_plan)) / float(max(1, global_expanded_count))
+    logs = {
+        "train-rl-main-loss": main_loss.detach() * scale,
+        "train-rl-top-loss": top_loss.detach() * scale,
+        "train-rl-bottom-loss": bottom_loss.detach() * scale,
+        "train-rl-aux-fm-loss": aux_fm_loss.detach() * scale,
+        "train-rl-anchor-loss": anchor_loss.detach() * scale,
+        "train-rl-bottom-branch-used": float(bool(bottom_mask.any())),
+        **pseudo.get("logs", {}),
+        **top_logs,
+        **bottom_logs,
+    }
+    return total * scale, logs
+
+
+def init_chunk_aggregate(model: Any) -> dict[str, float]:
+    keys = [
+        "train-rl-main-loss", "train-rl-top-loss", "train-rl-bottom-loss",
+        "train-rl-aux-fm-loss", "train-rl-anchor-loss",
+        "train-rl-delta-atom-abs-mean", "train-rl-delta-bond-abs-mean",
+        "train-rl-delta-charge-abs-mean", "train-rl-delta-coord-abs-mean",
+        "train-rl-bottom-branch-used", "train-rl-interpolant-mode",
+        "train-rl-pseudo-batch-size",
+    ]
+    return {key: 0.0 for key in keys}
+
+
+def update_chunk_aggregate(aggregate: dict[str, float], logs: Mapping[str, Any]) -> None:
+    for key in aggregate:
+        value = logs.get(key)
+        if value is None:
+            continue
+        if torch.is_tensor(value):
+            value = float(value.detach().cpu())
+        aggregate[key] += float(value)
+
+
+def finalize_chunk_aggregate(aggregate: dict[str, float], n_chunks: int) -> dict[str, float]:
+    averaged = {key: value for key, value in aggregate.items()}
+    for key in [
+        "train-rl-delta-atom-abs-mean", "train-rl-delta-bond-abs-mean",
+        "train-rl-delta-charge-abs-mean", "train-rl-delta-coord-abs-mean",
+        "train-rl-interpolant-mode",
+    ]:
+        averaged[key] = aggregate[key] / float(max(1, n_chunks))
+    return averaged
 
 
 def build_pseudo_training_batch(
@@ -498,23 +778,145 @@ def build_pseudo_training_batch(
     selected_indices: Sequence[int],
     selected_labels: Sequence[str],
 ) -> dict[str, Any]:
-    k_steps = max(1, int(getattr(model.hparams, "rl_num_stratified_timesteps", 1)))
-    expanded_candidates: list[Mapping[str, Any]] = []
-    for idx in selected_indices:
-        for _ in range(k_steps):
-            expanded_candidates.append(candidates[idx])
-    target = stack_targets([candidate["target"] for candidate in expanded_candidates], model.device)
-    times_cont, times_disc = stratified_times(len(expanded_candidates), k_steps, model.device)
-    interp = corrupt_ligand_like_flowr(target, times_cont, times_disc)
-    batch_indices = [int(candidate["batch_index"]) for candidate in expanded_candidates]
-    pocket = gather_pocket_for_candidates(model, data, prior, batch_indices)
-    times = [times_cont, times_disc, torch.zeros_like(times_cont), torch.zeros_like(times_cont)]
-    target["pocket_mask"] = pocket["mask"]
-    interp["fragment_mask"] = gather_optional_rows(prior.get("fragment_mask"), batch_indices, model.device)
-    interp["interactions"] = gather_optional_rows(prior.get("interactions"), batch_indices, model.device)
-    target["interactions"] = interp["interactions"]
-    return {"target": target, "interp": interp, "pocket": pocket, "times": times, "labels": selected_labels}
+    plan = expanded_selection_plan(selected_indices, selected_labels, max(1, int(getattr(model.hparams, "rl_num_stratified_timesteps", 1))))
+    return build_pseudo_training_batch_from_plan(model, prior, data, candidates, plan)
 
+
+def expanded_selection_plan(selected_indices: Sequence[int], selected_labels: Sequence[str], k_steps: int) -> list[tuple[int, str]]:
+    expanded: list[tuple[int, str]] = []
+    for idx, label in zip(selected_indices, selected_labels):
+        for _ in range(k_steps):
+            expanded.append((int(idx), str(label)))
+    return expanded
+
+
+def build_pseudo_training_batch_from_plan(
+    model: Any,
+    prior: Mapping[str, Any],
+    data: Mapping[str, Any],
+    candidates: Sequence[Mapping[str, Any]],
+    expanded_plan: Sequence[tuple[int, str]],
+) -> dict[str, Any]:
+    if not expanded_plan:
+        raise RuntimeError("Cannot build RL pseudo batch without selected expanded samples")
+    expanded_candidates = [candidates[idx] for idx, _ in expanded_plan]
+    expanded_labels = [label for _, label in expanded_plan]
+    times_cont, times_disc = stratified_times(len(expanded_candidates), max(1, int(getattr(model.hparams, "rl_num_stratified_timesteps", 1))), model.device)
+    mode = "original_interpolant"
+    try:
+        pseudo = build_pseudo_with_original_interpolant(model, data, expanded_candidates, expanded_labels, times_cont, times_disc)
+    except Exception as exc:
+        if bool(getattr(model.hparams, "rl_use_original_interpolant", True)) and not bool(getattr(model.hparams, "rl_allow_simple_corruption_fallback", False)):
+            raise RuntimeError(f"FLOWR original interpolant construction failed: {exc}") from exc
+        target = stack_targets([candidate["target"] for candidate in expanded_candidates], model.device)
+        interp = corrupt_ligand_like_flowr(target, times_cont, times_disc)
+        batch_indices = [int(candidate["batch_index"]) for candidate in expanded_candidates]
+        pocket = gather_pocket_for_candidates(model, data, prior, batch_indices)
+        target["pocket_mask"] = pocket["mask"]
+        interp["fragment_mask"] = gather_optional_rows(prior.get("fragment_mask"), batch_indices, model.device)
+        interp["interactions"] = gather_optional_rows(prior.get("interactions"), batch_indices, model.device)
+        target["interactions"] = interp["interactions"]
+        pseudo = {"target": target, "interp": interp, "pocket": pocket}
+        mode = "simple_fallback"
+    times = [times_cont, times_disc, torch.zeros_like(times_cont), torch.zeros_like(times_cont)]
+    pseudo["times"] = times
+    pseudo["labels"] = expanded_labels
+    pseudo["logs"] = {
+        "train-rl-interpolant-mode": 1.0 if mode == "original_interpolant" else 2.0,
+        "train-rl-num-stratified-timesteps": float(getattr(model.hparams, "rl_num_stratified_timesteps", 1)),
+        "train-rl-pseudo-batch-size": float(len(expanded_labels)),
+    }
+    assert len(expanded_labels) == int(pseudo["target"]["coords"].shape[0])
+    return pseudo
+
+
+def build_pseudo_with_original_interpolant(
+    model: Any,
+    data: Mapping[str, Any],
+    expanded_candidates: Sequence[Mapping[str, Any]],
+    expanded_labels: Sequence[str],
+    times_cont: torch.Tensor,
+    times_disc: torch.Tensor,
+) -> dict[str, Any]:
+    if not bool(getattr(model.hparams, "rl_use_original_interpolant", True)):
+        raise RuntimeError("rl_use_original_interpolant is false")
+    interpolant = getattr(model, "rl_train_interpolant", None)
+    if interpolant is None:
+        raise RuntimeError("model.rl_train_interpolant is not attached; cannot use original FLOWR interpolant")
+    systems = data.get("complex") or []
+    target_systems: list[PocketComplex] = []
+    interp_systems: list[PocketComplex] = []
+    for row, candidate in enumerate(expanded_candidates):
+        batch_idx = int(candidate["batch_index"])
+        base_system = systems[batch_idx]
+        to_ligand = target_to_geometric_mol(candidate["target"], model)
+        from_ligand = interpolant.prior_sampler.sample_molecule(to_ligand.seq_length)
+        from_ligand = interpolant._match_mols(from_ligand, to_ligand, mol_size=to_ligand.seq_length)
+        interp_ligand = interpolant._interpolate_mol(from_ligand, to_ligand, float(times_cont[row].detach().cpu()), float(times_disc[row].detach().cpu()))
+        holo = base_system.holo
+        apo = holo if getattr(interpolant, "rigid_pocket", False) or base_system.apo is None else base_system.apo
+        interp_pocket = interpolant._interpolate_pocket(apo, holo, times_cont[row].detach().cpu())
+        target_systems.append(base_system._copy_with(ligand=to_ligand, holo=holo, apo=apo, interactions=inactive_or_existing_interactions(base_system, to_ligand)))
+        interp_systems.append(PocketComplex(apo=interp_pocket, ligand=interp_ligand, interactions=inactive_or_existing_interactions(base_system, to_ligand), metadata=base_system.metadata, fragment_mask=None, com=base_system.com))
+    target_complex = complex_batch_to_training_dict(PocketComplexBatch.from_list(target_systems), state="holo", systems=target_systems, device=model.device)
+    interp_complex = complex_batch_to_training_dict(PocketComplexBatch.from_list(interp_systems), state="apo", systems=interp_systems, device=model.device)
+    target = model.builder.extract_ligand_from_complex(target_complex)
+    interp = model.builder.extract_ligand_from_complex(interp_complex)
+    pocket = model.builder.extract_pocket_from_complex(target_complex)
+    interp["fragment_mask"] = target_complex["fragment_mask"]
+    interp["interactions"] = interp_complex["interactions"]
+    target["interactions"] = target_complex["interactions"]
+    target["pocket_mask"] = pocket["mask"]
+    return {"target": target, "interp": interp, "pocket": pocket}
+
+
+def inactive_or_existing_interactions(base_system: Any, ligand: GeometricMol) -> Any:
+    # RL fine-tuning does not enable interaction/scaffold/linker inpainting.  If
+    # the original system has interaction tensors, keep the tensor shape but crop
+    #/pad only through the original PocketComplexBatch collation path.
+    return base_system.interactions if getattr(base_system, "interactions", None) is not None else None
+
+
+def target_to_geometric_mol(target: Mapping[str, torch.Tensor], model: Any) -> GeometricMol:
+    mask = target["mask"].bool().detach().cpu()
+    coords = target["coords"].detach().cpu()[mask]
+    atomics = target["atomics"].detach().cpu()[mask]
+    charges = target["charges"].detach().cpu()[mask] if "charges" in target else None
+    bonds = target["bonds"].detach().cpu()[mask][:, mask]
+    n_atoms = int(mask.sum().item())
+    bond_indices = torch.ones((n_atoms, n_atoms), dtype=torch.long).nonzero()
+    bond_types = bonds[bond_indices[:, 0], bond_indices[:, 1]]
+    return GeometricMol(coords, atomics, bond_indices=bond_indices, bond_types=bond_types, charges=charges, is_mmap=False)
+
+
+def complex_batch_to_training_dict(batch: PocketComplexBatch, state: str, systems: Sequence[Any], device: torch.device) -> dict[str, Any]:
+    out = batch.to_dict(state=state)
+    out["bonds"] = out.pop("bonds")
+    interactions = batch.interactions(state=state)
+    out["interactions"] = interactions if torch.is_tensor(interactions) else interactions
+    out["fragment_mask"] = batch.fragment_mask()
+    out["complex"] = list(systems)
+    if out.get("charges") is not None and torch.is_tensor(out["charges"]) and out["charges"].dim() == 2:
+        n_charges = len(smolRD.CHARGE_IDX_MAP.keys())
+        out["charges"] = smolF.one_hot_encode_tensor(out["charges"].long(), n_charges)
+    return {key: value.to(device) if torch.is_tensor(value) else value for key, value in out.items()}
+
+
+def masks_from_labels(labels: Sequence[str], device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    top_mask = torch.tensor([label == "top" for label in labels], device=device, dtype=torch.bool)
+    bottom_mask = torch.tensor([label == "bottom" for label in labels], device=device, dtype=torch.bool)
+    middle_mask = torch.tensor([label == "middle" for label in labels], device=device, dtype=torch.bool)
+    return top_mask, bottom_mask, middle_mask
+
+
+def expanded_count_logs(expanded_labels: Sequence[str], candidate_labels: Sequence[str]) -> dict[str, float]:
+    return {
+        "train-rl-num-top-candidates": float(sum(label == "top" for label in candidate_labels)),
+        "train-rl-num-bottom-candidates": float(sum(label == "bottom" for label in candidate_labels)),
+        "train-rl-num-top-expanded": float(sum(label == "top" for label in expanded_labels)),
+        "train-rl-num-bottom-expanded": float(sum(label == "bottom" for label in expanded_labels)),
+        "train-rl-expanded-selected-count": float(len(expanded_labels)),
+    }
 
 def stack_targets(targets: Sequence[Mapping[str, torch.Tensor]], device: torch.device) -> dict[str, torch.Tensor]:
     return {

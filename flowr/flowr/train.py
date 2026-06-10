@@ -121,6 +121,9 @@ def build_model(
         "rl_update_frequency": args.rl_update_frequency,
         "rl_sampling_steps": args.rl_sampling_steps,
         "rl_num_candidates_per_step": args.rl_num_candidates_per_step,
+        "rl_surrogate_chunk_size": args.rl_surrogate_chunk_size,
+        "rl_use_original_interpolant": args.rl_use_original_interpolant,
+        "rl_allow_simple_corruption_fallback": args.rl_allow_simple_corruption_fallback,
         "rl_sample_from_reference": args.rl_sample_from_reference,
         "rl_use_reference_model": args.rl_use_reference_model,
         "rl_ref_ema_decay": args.rl_ref_ema_decay,
@@ -838,6 +841,7 @@ def main(args):
         vocab_pocket_atoms=vocab_pocket_atoms,
         vocab_pocket_res=vocab_pocket_res,
     )
+    model.rl_train_interpolant = dm.train_interpolant
     print("Model complete.")
 
     print("Fitting datamodule to model...")
@@ -997,6 +1001,9 @@ if __name__ == "__main__":
     parser.add_argument("--rl_update_frequency", type=int, default=1)
     parser.add_argument("--rl_sampling_steps", type=int, default=100)
     parser.add_argument("--rl_num_candidates_per_step", type=int, default=1)
+    parser.add_argument("--rl_surrogate_chunk_size", type=int, default=0)
+    parser.add_argument("--rl_use_original_interpolant", action="store_true")
+    parser.add_argument("--rl_allow_simple_corruption_fallback", action="store_true")
     parser.add_argument("--rl_sample_from_reference", action="store_true")
     parser.add_argument("--rl_use_reference_model", action="store_true")
     parser.add_argument("--rl_ref_ema_decay", type=float, default=0.999)
@@ -1094,6 +1101,7 @@ if __name__ == "__main__":
         use_ema=True,
         self_condition=True,
         rl_sample_from_reference=True,
+        rl_use_original_interpolant=True,
         rl_use_reference_model=True,
         rl_detach_targets=True,
         rl_detach_reward=True,
