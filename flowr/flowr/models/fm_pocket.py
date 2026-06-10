@@ -1457,7 +1457,7 @@ class LigandPocketCFM(pl.LightningModule):
 
     def training_step(self, batch, b_idx):
         # Input data
-        _, data, interpolated, times = batch
+        prior, data, interpolated, times = batch
 
         # Extract pocket data
         pocket_data = self.builder.extract_pocket_from_complex(data)
