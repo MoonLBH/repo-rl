@@ -20,6 +20,7 @@ import flowr.util.metrics as Metrics
 import flowr.util.rdkit as smolRD
 from flowr.data.data_info import GeneralInfos as DataInfos
 from flowr.models.semla import MolecularGenerator
+from flowr.rl.training import maybe_apply_rl_finetune_loss, on_train_batch_end_update_reference, rl_chunkwise_manual_enabled, run_rl_chunkwise_manual_optimization
 from flowr.util.molrepr import GeometricMol
 from flowr.util.tokeniser import Vocabulary
 
@@ -1241,6 +1242,9 @@ class LigandPocketCFM(pl.LightningModule):
         self.use_t_loss_weights = use_t_loss_weights
 
         # Anything else passed into kwargs will also be saved
+        if bool(kwargs.get("enable_rl_finetune", False)) and float(kwargs.get("rl_loss_weight", 0.0)) > 0.0 and int(kwargs.get("rl_surrogate_chunk_size", 0) or 0) > 0:
+            self.automatic_optimization = False
+
         hparams = {
             "lr": lr,
             "coord_scale": coord_scale,
@@ -1453,7 +1457,7 @@ class LigandPocketCFM(pl.LightningModule):
 
     def training_step(self, batch, b_idx):
         # Input data
-        _, data, interpolated, times = batch
+        prior, data, interpolated, times = batch
 
         # Extract pocket data
         pocket_data = self.builder.extract_pocket_from_complex(data)
@@ -1465,6 +1469,7 @@ class LigandPocketCFM(pl.LightningModule):
         lig_data = self.builder.extract_ligand_from_complex(data)
         lig_data["interactions"] = data["interactions"]
         lig_data["pocket_mask"] = pocket_data["mask"]
+        lig_data["complex"] = data.get("complex")
         times = [times[:, 0], times[:, 1], times[:, 2], times[:, 3]]
 
         cond_batch = None
@@ -1525,6 +1530,10 @@ class LigandPocketCFM(pl.LightningModule):
 
         losses = self._loss(lig_data, lig_interp, predicted, times=ligand_times)
         loss = sum(list(losses.values()))
+        if rl_chunkwise_manual_enabled(self):
+            loss, rl_logs = run_rl_chunkwise_manual_optimization(self, loss, prior, data)
+        else:
+            loss, rl_logs = maybe_apply_rl_finetune_loss(self, loss, prior, data)
 
         for name, loss_val in losses.items():
             self.log(
@@ -1536,11 +1545,25 @@ class LigandPocketCFM(pl.LightningModule):
                 sync_dist=True,
             )
 
+        for name, log_val in rl_logs.items():
+            self.log(
+                name,
+                log_val,
+                prog_bar=False,
+                on_step=True,
+                logger=True,
+                sync_dist=True,
+            )
+
         self.log(
             "train-loss", loss, prog_bar=True, on_step=True, logger=True, sync_dist=True
         )
 
         return loss
+
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        on_train_batch_end_update_reference(self)
 
     def validation_step(self, batch, b_idx):
         # Input data
