@@ -12,6 +12,7 @@ import copy
 import hashlib
 import json
 import math
+import traceback
 from pathlib import Path
 from typing import Any, Mapping, Optional, Sequence
 
@@ -48,11 +49,37 @@ SKIP_REASON_IDS = {
     "pseudo_batch_error": 10,
     "reference_generation_failed": 11,
     "no_bottom_use_top_only": 12,
+    "reference_init_failed": 13,
 }
 
 
 def rl_enabled(hparams: Any) -> bool:
     return bool(getattr(hparams, "enable_rl_finetune", False)) and float(getattr(hparams, "rl_loss_weight", 0.0)) > 0.0
+
+
+def rl_debug_raise_exceptions(model: Any) -> bool:
+    return bool(getattr(model.hparams, "rl_debug_raise_exceptions", False))
+
+
+def is_rank0(model: Any) -> bool:
+    return int(getattr(model, "global_rank", 0) or 0) == 0
+
+
+def rank0_debug_print(model: Any, message: str) -> None:
+    if is_rank0(model):
+        print(message, flush=True)
+
+
+def handle_rl_exception(model: Any, reason: str, exc: BaseException) -> None:
+    rank0_debug_print(model, f"[train-rl] {reason}: {type(exc).__name__}: {exc}")
+    if is_rank0(model):
+        traceback.print_exception(type(exc), exc, exc.__traceback__)
+    if rl_debug_raise_exceptions(model):
+        raise exc
+
+
+def tensor_shape(value: Any) -> Any:
+    return tuple(value.shape) if torch.is_tensor(value) else None
 
 
 def maybe_apply_rl_finetune_loss(
@@ -61,13 +88,7 @@ def maybe_apply_rl_finetune_loss(
     prior: Mapping[str, Any],
     data: Mapping[str, Any],
 ) -> tuple[torch.Tensor, dict[str, Any]]:
-    """Apply LFPO-F-v2 surrogate to ``loss`` when the RL path is enabled.
-
-    Disabled path returns the original FLOWR loss and an empty log dict.  Enabled
-    path samples candidates with the explicit reference generator, scores them,
-    selects top/bottom, rebuilds noisy training states, and computes a detached
-    reward-guided top-imitation/bottom-repulsion surrogate.
-    """
+    """Apply LFPO-F-v2 surrogate to ``loss`` when the RL path is enabled."""
 
     if not rl_enabled(model.hparams):
         return loss, {}
@@ -79,43 +100,66 @@ def maybe_apply_rl_finetune_loss(
 
     try:
         ref_model = ensure_reference_model(model)
+    except Exception as exc:
+        handle_rl_exception(model, "reference_init_failed", exc)
+        logs.update(skip_logs("reference_init_failed"))
+        return loss, logs
+
+    try:
         candidates = sample_reference_candidates(model, ref_model, prior, data)
         logs.update(candidate_sampling_logs(model))
-        if not candidates:
-            logs.update(skip_logs("no_candidates"))
-            return loss, logs
-        rewards, cache_hit_rate = get_candidate_rewards(model, candidates)
-        if not rewards:
-            logs.update(skip_logs("missing_rewards"))
-            return loss, logs
-        if enabled_metrics_all_failed(rewards, model.hparams):
-            logs.update(reward_summary_logs(rewards, empty_selection_summary(rewards), cache_hit_rate))
-            logs.update(skip_logs("all_enabled_metrics_failed"))
-            return loss, logs
-        selection = select_rewards_for_training(model, rewards)
-        logs.update(reward_summary_logs(rewards, selection, cache_hit_rate))
-        surrogate, surrogate_logs = lfpof_v2_surrogate_loss(model, ref_model, prior, data, candidates, rewards, selection)
-        logs.update(surrogate_logs)
-        if surrogate is None:
-            logs.update(skip_logs("no_top"))
-            return loss, logs
-        if not torch.isfinite(surrogate):
-            logs.update(skip_logs("nan_loss"))
-            return loss, logs
-        logs["train-rl-loss"] = surrogate.detach()
-        return loss + float(model.hparams.rl_loss_weight) * surrogate, logs
-    except RuntimeError as exc:
-        if "interpolant" in str(exc).lower():
-            logs.update(skip_logs("interpolant_error"))
-        elif "pseudo" in str(exc).lower():
-            logs.update(skip_logs("pseudo_batch_error"))
-        else:
-            logs.update(skip_logs("surrogate_error"))
+    except Exception as exc:
+        handle_rl_exception(model, "reference_generation_failed", exc)
+        logs.update(skip_logs("reference_generation_failed"))
         return loss, logs
-    except Exception:
+
+    if not candidates:
+        logs.update(skip_logs("no_candidates"))
+        return loss, logs
+
+    try:
+        rewards, cache_hit_rate = get_candidate_rewards(model, candidates)
+    except Exception as exc:
+        handle_rl_exception(model, "metric_error", exc)
         logs.update(skip_logs("metric_error"))
         return loss, logs
 
+    if not rewards:
+        logs.update(skip_logs("missing_rewards"))
+        return loss, logs
+    if enabled_metrics_all_failed(rewards, model.hparams):
+        logs.update(reward_summary_logs(rewards, empty_selection_summary(rewards), cache_hit_rate))
+        logs.update(skip_logs("all_enabled_metrics_failed"))
+        return loss, logs
+
+    selection = select_rewards_for_training(model, rewards)
+    logs.update(reward_summary_logs(rewards, selection, cache_hit_rate))
+    try:
+        surrogate, surrogate_logs = lfpof_v2_surrogate_loss(model, ref_model, prior, data, candidates, rewards, selection)
+    except RuntimeError as exc:
+        if "interpolant" in str(exc).lower():
+            reason = "interpolant_error"
+        elif "pseudo" in str(exc).lower():
+            reason = "pseudo_batch_error"
+        else:
+            reason = "surrogate_error"
+        handle_rl_exception(model, reason, exc)
+        logs.update(skip_logs(reason))
+        return loss, logs
+    except Exception as exc:
+        handle_rl_exception(model, "surrogate_error", exc)
+        logs.update(skip_logs("surrogate_error"))
+        return loss, logs
+
+    logs.update(surrogate_logs)
+    if surrogate is None:
+        logs.update(skip_logs("no_top"))
+        return loss, logs
+    if not torch.isfinite(surrogate):
+        logs.update(skip_logs("nan_loss"))
+        return loss, logs
+    logs["train-rl-loss"] = surrogate.detach()
+    return loss + float(model.hparams.rl_loss_weight) * surrogate, logs
 
 
 def rl_chunkwise_manual_enabled(model: Any) -> bool:
@@ -154,16 +198,23 @@ def run_rl_chunkwise_manual_optimization(
 
     try:
         ref_model = ensure_reference_model(model)
+    except Exception as exc:
+        handle_rl_exception(model, "reference_init_failed", exc)
+        return finish("reference_init_failed")
+
+    try:
         candidates = sample_reference_candidates(model, ref_model, prior, data)
         logs.update(candidate_sampling_logs(model))
-    except Exception:
+    except Exception as exc:
+        handle_rl_exception(model, "reference_generation_failed", exc)
         return finish("reference_generation_failed")
     if not candidates:
         return finish("no_candidates")
 
     try:
         rewards, cache_hit_rate = get_candidate_rewards(model, candidates)
-    except Exception:
+    except Exception as exc:
+        handle_rl_exception(model, "metric_error", exc)
         return finish("metric_error")
     if not rewards:
         return finish("missing_rewards")
@@ -201,9 +252,15 @@ def run_rl_chunkwise_manual_optimization(
             del chunk_loss
     except RuntimeError as exc:
         if "interpolant" in str(exc).lower():
-            return finish("interpolant_error", total_rl_value)
-        return finish("surrogate_error", total_rl_value)
-    except Exception:
+            reason = "interpolant_error"
+        elif "pseudo" in str(exc).lower():
+            reason = "pseudo_batch_error"
+        else:
+            reason = "surrogate_error"
+        handle_rl_exception(model, reason, exc)
+        return finish(reason, total_rl_value)
+    except Exception as exc:
+        handle_rl_exception(model, "surrogate_error", exc)
         return finish("surrogate_error", total_rl_value)
 
     logs.update(finalize_chunk_aggregate(aggregate, max(1, len(chunks))))
@@ -430,6 +487,15 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
     ref_ligs = [system.ligand.orig_mol.to_rdkit() for system in systems]
 
     was_training = sampler_model.training
+    rank0_debug_print(
+        model,
+        "[train-rl] reference generation input: "
+        f"num_rounds={num_rounds}, sampling_steps={sampling_steps}, "
+        f"sampler_model.training={sampler_model.training}, "
+        f"lig_prior_mask_shape={tensor_shape(lig_prior.get('mask'))}, "
+        f"pocket_mask_shape={tensor_shape(pocket_data.get('mask'))}, "
+        f"len_systems={len(systems)}, system0_type={type(systems[0]).__name__ if systems else None}",
+    )
     sampler_model.eval()
     with torch.no_grad():
         for round_idx in range(num_rounds):
@@ -441,8 +507,20 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
                 strategy=model.sampling_strategy,
                 corr_iters=model.corrector_iters,
             )
+            rank0_debug_print(
+                model,
+                "[train-rl] reference generation output: "
+                f"round_idx={round_idx}, generated_keys={sorted(generated.keys())}, "
+                f"generated_mask_shape={tensor_shape(generated.get('mask'))}",
+            )
             mols = sampler_model._generate_mols(generated)
             train_targets = generated_to_training_targets(model, generated, systems)
+            rank0_debug_print(
+                model,
+                "[train-rl] reference mol conversion: "
+                f"round_idx={round_idx}, len_mols={len(mols)}, "
+                f"train_targets_mask_shape={tensor_shape(train_targets.get('mask'))}",
+            )
             batch_size = int(train_targets["mask"].size(0))
             for idx in range(batch_size):
                 system = systems[idx] if idx < len(systems) else None
@@ -464,6 +542,7 @@ def sample_reference_candidates(model: Any, ref_model: Any, prior: Mapping[str, 
     if was_training:
         sampler_model.train()
     model._rl_last_num_candidates = len(candidates)
+    rank0_debug_print(model, f"[train-rl] reference generation final: len_candidates={len(candidates)}")
     return candidates
 
 

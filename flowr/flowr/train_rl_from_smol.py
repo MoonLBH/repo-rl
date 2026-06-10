@@ -127,6 +127,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rl_reference_checkpoint", default=None)
     parser.add_argument("--rl_use_original_interpolant", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--rl_allow_simple_corruption_fallback", action="store_true")
+    parser.add_argument("--rl_debug_raise_exceptions", action="store_true", help="Re-raise RL reference/metric/interpolant/surrogate exceptions instead of logging a skip reason.")
 
     # Reward metric controls.
     parser.add_argument("--rl_objective_mode", default="strain", choices=["plif", "strain", "vina", "plif_strain", "plif_vina", "strain_vina", "plif_strain_vina"])
@@ -417,6 +418,7 @@ def apply_finetune_overrides(model: Any, args: argparse.Namespace, sample_count:
         "rl_reference_checkpoint": args.rl_reference_checkpoint,
         "rl_use_original_interpolant": args.rl_use_original_interpolant,
         "rl_allow_simple_corruption_fallback": args.rl_allow_simple_corruption_fallback,
+        "rl_debug_raise_exceptions": args.rl_debug_raise_exceptions,
         "rl_objective_mode": args.rl_objective_mode,
         "rl_multiobjective_strategy": args.rl_multiobjective_strategy,
         "rl_metric_source": args.rl_metric_source,
