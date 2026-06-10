@@ -1344,6 +1344,42 @@ class LigandPocketCFM(pl.LightningModule):
 
         self._init_params()
 
+    def _as_class_ids(self, x, name: str):
+        if x is None:
+            return None
+
+        # one-hot / probability / logits: [B, N, C] -> [B, N]
+        if x.dim() == 3:
+            return torch.argmax(x, dim=-1)
+
+        # already class ids: [B, N]
+        if x.dim() == 2:
+            return x.long()
+
+        # accidental singleton: [B, 1, N, C] -> [B, N]
+        if x.dim() == 4 and x.size(1) == 1:
+            return torch.argmax(x[:, 0], dim=-1)
+
+        raise RuntimeError(f"{name} must be [B,N], [B,N,C], or [B,1,N,C], got {tuple(x.shape)}")
+
+    def _as_pair_class_ids(self, x, name: str):
+        if x is None:
+            return None
+
+        # one-hot / probability / logits: [B, N, N, C] -> [B, N, N]
+        if x.dim() == 4:
+            return torch.argmax(x, dim=-1)
+
+        # already class ids: [B, N, N]
+        if x.dim() == 3:
+            return x.long()
+
+        # accidental singleton: [B, 1, N, N, C] -> [B, N, N]
+        if x.dim() == 5 and x.size(1) == 1:
+            return torch.argmax(x[:, 0], dim=-1)
+
+        raise RuntimeError(f"{name} must be [B,N,N], [B,N,N,C], or [B,1,N,N,C], got {tuple(x.shape)}")
+
     def forward(
         self,
         batch,
@@ -1378,6 +1414,8 @@ class LigandPocketCFM(pl.LightningModule):
         pocket_charges = pocket_batch["charges"]
         pocket_res = pocket_batch["res_names"]
         pocket_mask = pocket_batch["mask"]
+        pocket_atom_charge_ids = self._as_class_ids(pocket_charges, "pocket_charges")
+        pocket_bond_type_ids = self._as_pair_class_ids(pocket_bonds, "pocket_bonds")
 
         interactions = batch["interactions"] if self.flow_interactions else None
 
@@ -1419,8 +1457,8 @@ class LigandPocketCFM(pl.LightningModule):
                 cond_bonds=cond_batch["bonds"],
                 pocket_coords=pocket_coords,
                 pocket_atom_names=pocket_atoms,
-                pocket_atom_charges=torch.argmax(pocket_charges, dim=-1),
-                pocket_bond_types=torch.argmax(pocket_bonds, dim=-1),
+                pocket_atom_charges=pocket_atom_charge_ids,
+                pocket_bond_types=pocket_bond_type_ids,
                 pocket_res_types=pocket_res,
                 pocket_atom_mask=pocket_mask,
                 pocket_equis=pocket_equis,
@@ -1440,9 +1478,9 @@ class LigandPocketCFM(pl.LightningModule):
                 extra_feats=times,
                 pocket_coords=pocket_coords,
                 pocket_atom_names=pocket_atoms,
-                pocket_atom_charges=pocket_charges,
+                pocket_atom_charges=pocket_atom_charge_ids,
                 pocket_res_types=pocket_res,
-                pocket_bond_types=torch.argmax(pocket_bonds, dim=-1),
+                pocket_bond_types=pocket_bond_type_ids,
                 pocket_atom_mask=pocket_mask,
                 pocket_equis=pocket_equis,
                 pocket_invs=pocket_invs,
