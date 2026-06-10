@@ -399,6 +399,8 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-aux-fm-loss": 0.0,
         "train-rl-anchor-loss": 0.0,
         "train-rl-loss-weight": float(getattr(model.hparams, "rl_loss_weight", 0.0)),
+        "train-rl-self-condition": float(bool(getattr(model, "self_condition", False))),
+        "train-rl-self-condition-mode": 1.0 if bool(getattr(model, "self_condition", False)) else 0.0,
         "train-rl-reference-type": 1.0,
         "train-rl-ref-ema-decay": float(getattr(model.hparams, "rl_ref_ema_decay", 0.999)),
         "train-rl-objective-mode": float(OBJECTIVE_MODE_IDS.get(getattr(model.hparams, "rl_objective_mode", "strain"), 0)),
@@ -1561,9 +1563,28 @@ def gather_optional_rows(value: Any, batch_indices: Sequence[int], device: torch
     return value
 
 
+def make_zero_self_condition_batch(model: Any, ligand_batch: Mapping[str, torch.Tensor]) -> Optional[dict[str, torch.Tensor]]:
+    """Return a zero self-conditioning batch when the model uses self conditioning.
+
+    FLOWR training initializes self-conditioning with zeros.  RL surrogate
+    forward passes follow the same input contract instead of calling
+    ``model.forward`` with ``cond_batch=None`` when self-conditioning is enabled.
+    """
+
+    if not bool(getattr(model, "self_condition", False)):
+        return None
+
+    return {
+        "coords": torch.zeros_like(ligand_batch["coords"]),
+        "atomics": torch.zeros_like(ligand_batch["atomics"]),
+        "bonds": torch.zeros_like(ligand_batch["bonds"]),
+    }
+
+
 def forward_ligand_pocket(model: Any, pseudo: Mapping[str, Any]) -> dict[str, torch.Tensor]:
     debug_pseudo_shapes_once(model, pseudo)
-    out = model(pseudo["interp"], pseudo["pocket"], pseudo["times"], training=True, cond_batch=None)
+    cond_batch = make_zero_self_condition_batch(model, pseudo["interp"])
+    out = model(pseudo["interp"], pseudo["pocket"], pseudo["times"], training=True, cond_batch=cond_batch)
     predicted = {"coords": out[0], "atomics": out[1], "bonds": out[2], "charges": out[3], "mask": pseudo["target"]["mask"]}
     if getattr(model, "predict_interactions", False) or getattr(model, "flow_interactions", False):
         predicted["interactions"] = out[4]
