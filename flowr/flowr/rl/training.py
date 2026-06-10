@@ -66,6 +66,10 @@ def rl_debug_reference_generation(model: Any) -> bool:
     return bool(getattr(model.hparams, "rl_debug_reference_generation", False))
 
 
+def rl_debug_pseudo_shapes(model: Any) -> bool:
+    return bool(getattr(model.hparams, "rl_debug_pseudo_shapes", False))
+
+
 def is_rank0(model: Any) -> bool:
     return int(getattr(model, "global_rank", 0) or 0) == 0
 
@@ -1188,20 +1192,103 @@ def normalize_optional_interactions(value: Any, ligand_mask: torch.Tensor, devic
     return out
 
 
+def squeeze_extra_singleton_dim(x: Any, expected_dim: int, name: str) -> Any:
+    # If an accidental singleton is present, e.g. [B, 1, P, C], squeeze it to [B, P, C].
+    while torch.is_tensor(x) and x.dim() > expected_dim:
+        squeezed = False
+        for dim in range(1, x.dim()):
+            if x.size(dim) == 1:
+                x = x.squeeze(dim)
+                squeezed = True
+                break
+        if not squeezed:
+            raise RuntimeError(
+                f"{name} has too many dims and no squeezable singleton: "
+                f"shape={tuple(x.shape)}, expected_dim={expected_dim}"
+            )
+    return x
+
+
+def normalize_ligand_batch_tensors(lig: Mapping[str, Any], device: torch.device, name: str) -> dict[str, Any]:
+    out = dict(lig)
+    for key, value in list(out.items()):
+        if torch.is_tensor(value):
+            out[key] = value.to(device)
+
+    out["coords"] = squeeze_extra_singleton_dim(out["coords"], 3, f"{name}.coords")
+    out["atomics"] = squeeze_extra_singleton_dim(out["atomics"], 3, f"{name}.atomics")
+    out["charges"] = squeeze_extra_singleton_dim(out["charges"], 3, f"{name}.charges")
+    out["bonds"] = squeeze_extra_singleton_dim(out["bonds"], 4, f"{name}.bonds")
+    out["mask"] = squeeze_extra_singleton_dim(out["mask"], 2, f"{name}.mask").bool()
+
+    batch_size, n_atoms = out["mask"].shape
+    if out["coords"].shape[:2] != (batch_size, n_atoms):
+        raise RuntimeError(f"{name}.coords/mask mismatch: coords={tuple(out['coords'].shape)}, mask={tuple(out['mask'].shape)}")
+    if out["atomics"].shape[:2] != (batch_size, n_atoms):
+        raise RuntimeError(f"{name}.atomics/mask mismatch: atomics={tuple(out['atomics'].shape)}, mask={tuple(out['mask'].shape)}")
+    if out["charges"].shape[:2] != (batch_size, n_atoms):
+        raise RuntimeError(f"{name}.charges/mask mismatch: charges={tuple(out['charges'].shape)}, mask={tuple(out['mask'].shape)}")
+    if out["bonds"].shape[:3] != (batch_size, n_atoms, n_atoms):
+        raise RuntimeError(f"{name}.bonds/mask mismatch: bonds={tuple(out['bonds'].shape)}, mask={tuple(out['mask'].shape)}")
+
+    return out
+
+
+def normalize_pocket_batch_tensors(pocket: Mapping[str, Any], device: torch.device) -> dict[str, Any]:
+    out = dict(pocket)
+    for key, value in list(out.items()):
+        if torch.is_tensor(value):
+            out[key] = value.to(device)
+
+    if "coords" in out and torch.is_tensor(out["coords"]):
+        out["coords"] = squeeze_extra_singleton_dim(out["coords"], 3, "pocket.coords")
+        if out["coords"].dim() != 3:
+            raise RuntimeError(f"pocket.coords must be [B,P,3], got {tuple(out['coords'].shape)}")
+
+    if "mask" in out and torch.is_tensor(out["mask"]):
+        out["mask"] = squeeze_extra_singleton_dim(out["mask"], 2, "pocket.mask").bool()
+        if out["mask"].dim() != 2:
+            raise RuntimeError(f"pocket.mask must be [B,P], got {tuple(out['mask'].shape)}")
+
+    for key in ["atom_names", "res_names"]:
+        if key in out and torch.is_tensor(out[key]):
+            out[key] = squeeze_extra_singleton_dim(out[key], 2, f"pocket.{key}")
+            if out[key].dim() != 2:
+                raise RuntimeError(f"pocket.{key} must be [B,P], got {tuple(out[key].shape)}")
+            out[key] = out[key].long()
+
+    if "charges" in out and torch.is_tensor(out["charges"]):
+        out["charges"] = squeeze_extra_singleton_dim(out["charges"], 3, "pocket.charges")
+        if out["charges"].dim() != 3:
+            raise RuntimeError(f"pocket.charges must be [B,P,C], got {tuple(out['charges'].shape)}")
+
+    if "bonds" in out and torch.is_tensor(out["bonds"]):
+        out["bonds"] = squeeze_extra_singleton_dim(out["bonds"], 4, "pocket.bonds")
+        if out["bonds"].dim() != 4:
+            raise RuntimeError(f"pocket.bonds must be [B,P,P,C], got {tuple(out['bonds'].shape)}")
+
+    if "mask" in out:
+        batch_size, n_atoms = out["mask"].shape
+        if "coords" in out and out["coords"].shape[:2] != (batch_size, n_atoms):
+            raise RuntimeError(f"pocket coords/mask mismatch: coords={tuple(out['coords'].shape)}, mask={tuple(out['mask'].shape)}")
+        if "charges" in out and out["charges"].shape[:2] != (batch_size, n_atoms):
+            raise RuntimeError(f"pocket charges/mask mismatch: charges={tuple(out['charges'].shape)}, mask={tuple(out['mask'].shape)}")
+        if "atom_names" in out and out["atom_names"].shape[:2] != (batch_size, n_atoms):
+            raise RuntimeError(f"pocket atom_names/mask mismatch: atom_names={tuple(out['atom_names'].shape)}, mask={tuple(out['mask'].shape)}")
+        if "res_names" in out and out["res_names"].shape[:2] != (batch_size, n_atoms):
+            raise RuntimeError(f"pocket res_names/mask mismatch: res_names={tuple(out['res_names'].shape)}, mask={tuple(out['mask'].shape)}")
+        if "bonds" in out and out["bonds"].shape[:3] != (batch_size, n_atoms, n_atoms):
+            raise RuntimeError(f"pocket bonds/mask mismatch: bonds={tuple(out['bonds'].shape)}, mask={tuple(out['mask'].shape)}")
+
+    return out
+
+
 def normalize_pseudo_batch_tensors(pseudo: dict[str, Any], model: Any) -> dict[str, Any]:
     device = model.device
 
-    for section in ["target", "interp", "pocket"]:
-        if section not in pseudo or pseudo[section] is None:
-            continue
-        for key, value in list(pseudo[section].items()):
-            if key == "complex" or key in ["labels"]:
-                continue
-            if torch.is_tensor(value):
-                pseudo[section][key] = value.to(device)
-
-    pseudo["target"]["mask"] = ensure_tensor_on_device(pseudo["target"]["mask"], device).bool()
-    pseudo["interp"]["mask"] = ensure_tensor_on_device(pseudo["interp"]["mask"], device).bool()
+    pseudo["target"] = normalize_ligand_batch_tensors(pseudo["target"], device, "target")
+    pseudo["interp"] = normalize_ligand_batch_tensors(pseudo["interp"], device, "interp")
+    pseudo["pocket"] = normalize_pocket_batch_tensors(pseudo["pocket"], device)
 
     # ``fm_pocket.forward`` expects a tensor fragment mask whenever any
     # inpainting flag is enabled.  RL fine-tuning is not an inpainting task, so
@@ -1233,6 +1320,32 @@ def normalize_pseudo_batch_tensors(pseudo: dict[str, Any], model: Any) -> dict[s
         )
 
     return pseudo
+
+
+def debug_pseudo_shapes_once(model: Any, pseudo: Mapping[str, Any]) -> None:
+    if not rl_debug_pseudo_shapes(model):
+        return
+    if bool(model.__dict__.get("_rl_debug_pseudo_shapes_printed", False)):
+        return
+    model.__dict__["_rl_debug_pseudo_shapes_printed"] = True
+
+    target = pseudo.get("target", {})
+    interp = pseudo.get("interp", {})
+    pocket = pseudo.get("pocket", {})
+    times = pseudo.get("times", [])
+    rank0_debug_print(
+        model,
+        "[train-rl] pseudo shapes: "
+        f"target(coords={tensor_shape(target.get('coords'))}, atomics={tensor_shape(target.get('atomics'))}, "
+        f"charges={tensor_shape(target.get('charges'))}, bonds={tensor_shape(target.get('bonds'))}, mask={tensor_shape(target.get('mask'))}); "
+        f"interp(coords={tensor_shape(interp.get('coords'))}, atomics={tensor_shape(interp.get('atomics'))}, "
+        f"charges={tensor_shape(interp.get('charges'))}, bonds={tensor_shape(interp.get('bonds'))}, "
+        f"mask={tensor_shape(interp.get('mask'))}, fragment_mask={tensor_shape(interp.get('fragment_mask'))}); "
+        f"pocket(coords={tensor_shape(pocket.get('coords'))}, atom_names={tensor_shape(pocket.get('atom_names'))}, "
+        f"res_names={tensor_shape(pocket.get('res_names'))}, charges={tensor_shape(pocket.get('charges'))}, "
+        f"bonds={tensor_shape(pocket.get('bonds'))}, mask={tensor_shape(pocket.get('mask'))}); "
+        f"times={[tensor_shape(t) for t in times]}",
+    )
 
 
 def build_pseudo_with_original_interpolant(
@@ -1449,6 +1562,7 @@ def gather_optional_rows(value: Any, batch_indices: Sequence[int], device: torch
 
 
 def forward_ligand_pocket(model: Any, pseudo: Mapping[str, Any]) -> dict[str, torch.Tensor]:
+    debug_pseudo_shapes_once(model, pseudo)
     out = model(pseudo["interp"], pseudo["pocket"], pseudo["times"], training=True, cond_batch=None)
     predicted = {"coords": out[0], "atomics": out[1], "bonds": out[2], "charges": out[3], "mask": pseudo["target"]["mask"]}
     if getattr(model, "predict_interactions", False) or getattr(model, "flow_interactions", False):
