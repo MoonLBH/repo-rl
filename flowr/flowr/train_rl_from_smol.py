@@ -97,6 +97,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_ema", action="store_true", help="Ignored in this RL entry; the explicit RL reference model has its own EMA.")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--n_validation_mols", type=int, default=DEFAULT_N_VALIDATION_MOLS)
+    parser.add_argument("--ckpt_every_n_train_steps", type=int, default=1000, help="Save RL checkpoints every N training steps.")
+    parser.add_argument("--ckpt_save_last", action=argparse.BooleanOptionalAction, default=True, help="Whether to keep last.ckpt for RL fine-tuning.")
 
     # Generation / RL candidate sampling semantics aligned with generate_from_smol.
     parser.add_argument("--sample_n_molecules_per_target", type=int, default=None, help="Number of RL candidates sampled per pocket/target at each RL update.")
@@ -340,10 +342,12 @@ def build_rl_trainer(args: argparse.Namespace, model: Any):
 
     ckpt_callback = ModelCheckpoint(
         dirpath=str(checkpoint_dir),
-        filename="{epoch:03d}-{step}",
+        filename="step-{step}",
         save_top_k=-1,
-        every_n_epochs=1,
-        save_last=True,
+        every_n_train_steps=max(1, int(args.ckpt_every_n_train_steps)),
+        every_n_epochs=0,
+        save_last=bool(args.ckpt_save_last),
+        monitor=None,
     )
     callbacks = [
         LearningRateMonitor(logging_interval="step"),

@@ -410,6 +410,15 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-num-valid": 0.0,
         "train-rl-num-posebusters-valid": 0.0,
         "train-rl-num-metric-success": 0.0,
+        "train-rl-valid-frac": 0.0,
+        "train-rl-posebusters-valid-frac": 0.0,
+        "train-rl-metric-success-frac": 0.0,
+        "train-rl-top-frac": 0.0,
+        "train-rl-bottom-frac": 0.0,
+        "train-rl-middle-frac": 0.0,
+        "train-rl-feasible-frac": 0.0,
+        "train-rl-eligible-top-frac": 0.0,
+        "train-rl-eligible-bottom-frac": 0.0,
         "train-rl-num-top": 0.0,
         "train-rl-num-bottom": 0.0,
         "train-rl-num-middle": 0.0,
@@ -1698,6 +1707,16 @@ def discrete_kl_to_ref(cur_logits: torch.Tensor, ref_logits: torch.Tensor, mask:
 
 def reward_summary_logs(rewards: Sequence[Mapping[str, Any]], selection: Mapping[str, Any], cache_hit_rate: float) -> dict[str, Any]:
     n = len(rewards)
+    denom = max(1, n)
+    num_valid = sum(bool(r.get("valid")) for r in rewards)
+    num_posebusters_valid = sum(bool(r.get("posebusters_valid")) for r in rewards)
+    num_metric_success = sum(bool(r.get("metric_success")) for r in rewards)
+    num_feasible = sum(bool(r.get("feasible")) for r in rewards)
+    num_eligible_top = sum(bool(r.get("eligible_top")) for r in rewards)
+    num_eligible_bottom = sum(bool(r.get("eligible_bottom")) for r in rewards)
+    top_indices = selection.get("top_indices", [])
+    bottom_indices = selection.get("bottom_indices", [])
+    middle_indices = selection.get("middle_indices", [])
     plifs = finite_values(rewards, "plif_tanimoto")
     strains = finite_values(rewards, "strain_energy")
     vinas = finite_values(rewards, "vina_score")
@@ -1705,9 +1724,18 @@ def reward_summary_logs(rewards: Sequence[Mapping[str, Any]], selection: Mapping
     enabled_metrics = set(selection.get("summary", {}).get("enabled_metrics", []))
     return {
         "train-rl-num-candidates": float(n),
-        "train-rl-num-valid": float(sum(bool(r.get("valid")) for r in rewards)),
-        "train-rl-num-posebusters-valid": float(sum(bool(r.get("posebusters_valid")) for r in rewards)),
-        "train-rl-num-metric-success": float(sum(bool(r.get("metric_success")) for r in rewards)),
+        "train-rl-num-valid": float(num_valid),
+        "train-rl-num-posebusters-valid": float(num_posebusters_valid),
+        "train-rl-num-metric-success": float(num_metric_success),
+        "train-rl-valid-frac": float(num_valid / denom),
+        "train-rl-posebusters-valid-frac": float(num_posebusters_valid / denom),
+        "train-rl-metric-success-frac": float(num_metric_success / denom),
+        "train-rl-top-frac": float(len(top_indices) / denom),
+        "train-rl-bottom-frac": float(len(bottom_indices) / denom),
+        "train-rl-middle-frac": float(len(middle_indices) / denom),
+        "train-rl-feasible-frac": float(num_feasible / denom),
+        "train-rl-eligible-top-frac": float(num_eligible_top / denom),
+        "train-rl-eligible-bottom-frac": float(num_eligible_bottom / denom),
         "train-rl-num-top": float(selection["summary"]["num_top"]),
         "train-rl-num-bottom": float(selection["summary"]["num_bottom"]),
         "train-rl-num-middle": float(selection["summary"].get("num_middle", 0)),
