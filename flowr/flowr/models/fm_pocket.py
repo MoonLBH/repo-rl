@@ -20,6 +20,7 @@ import flowr.util.metrics as Metrics
 import flowr.util.rdkit as smolRD
 from flowr.data.data_info import GeneralInfos as DataInfos
 from flowr.models.semla import MolecularGenerator
+from flowr.rl.training import maybe_apply_rl_finetune_loss, on_train_batch_end_update_reference, rl_chunkwise_manual_enabled, run_rl_chunkwise_manual_optimization
 from flowr.util.molrepr import GeometricMol
 from flowr.util.tokeniser import Vocabulary
 
@@ -1241,6 +1242,9 @@ class LigandPocketCFM(pl.LightningModule):
         self.use_t_loss_weights = use_t_loss_weights
 
         # Anything else passed into kwargs will also be saved
+        if bool(kwargs.get("enable_rl_finetune", False)) and float(kwargs.get("rl_loss_weight", 0.0)) > 0.0 and int(kwargs.get("rl_surrogate_chunk_size", 0) or 0) > 0:
+            self.automatic_optimization = False
+
         hparams = {
             "lr": lr,
             "coord_scale": coord_scale,
@@ -1340,6 +1344,42 @@ class LigandPocketCFM(pl.LightningModule):
 
         self._init_params()
 
+    def _as_class_ids(self, x, name: str):
+        if x is None:
+            return None
+
+        # one-hot / probability / logits: [B, N, C] -> [B, N]
+        if x.dim() == 3:
+            return torch.argmax(x, dim=-1)
+
+        # already class ids: [B, N]
+        if x.dim() == 2:
+            return x.long()
+
+        # accidental singleton: [B, 1, N, C] -> [B, N]
+        if x.dim() == 4 and x.size(1) == 1:
+            return torch.argmax(x[:, 0], dim=-1)
+
+        raise RuntimeError(f"{name} must be [B,N], [B,N,C], or [B,1,N,C], got {tuple(x.shape)}")
+
+    def _as_pair_class_ids(self, x, name: str):
+        if x is None:
+            return None
+
+        # one-hot / probability / logits: [B, N, N, C] -> [B, N, N]
+        if x.dim() == 4:
+            return torch.argmax(x, dim=-1)
+
+        # already class ids: [B, N, N]
+        if x.dim() == 3:
+            return x.long()
+
+        # accidental singleton: [B, 1, N, N, C] -> [B, N, N]
+        if x.dim() == 5 and x.size(1) == 1:
+            return torch.argmax(x[:, 0], dim=-1)
+
+        raise RuntimeError(f"{name} must be [B,N,N], [B,N,N,C], or [B,1,N,N,C], got {tuple(x.shape)}")
+
     def forward(
         self,
         batch,
@@ -1374,6 +1414,8 @@ class LigandPocketCFM(pl.LightningModule):
         pocket_charges = pocket_batch["charges"]
         pocket_res = pocket_batch["res_names"]
         pocket_mask = pocket_batch["mask"]
+        pocket_atom_charge_ids = self._as_class_ids(pocket_charges, "pocket_charges")
+        pocket_bond_type_ids = self._as_pair_class_ids(pocket_bonds, "pocket_bonds")
 
         interactions = batch["interactions"] if self.flow_interactions else None
 
@@ -1415,8 +1457,8 @@ class LigandPocketCFM(pl.LightningModule):
                 cond_bonds=cond_batch["bonds"],
                 pocket_coords=pocket_coords,
                 pocket_atom_names=pocket_atoms,
-                pocket_atom_charges=torch.argmax(pocket_charges, dim=-1),
-                pocket_bond_types=torch.argmax(pocket_bonds, dim=-1),
+                pocket_atom_charges=pocket_atom_charge_ids,
+                pocket_bond_types=pocket_bond_type_ids,
                 pocket_res_types=pocket_res,
                 pocket_atom_mask=pocket_mask,
                 pocket_equis=pocket_equis,
@@ -1436,9 +1478,9 @@ class LigandPocketCFM(pl.LightningModule):
                 extra_feats=times,
                 pocket_coords=pocket_coords,
                 pocket_atom_names=pocket_atoms,
-                pocket_atom_charges=pocket_charges,
+                pocket_atom_charges=pocket_atom_charge_ids,
                 pocket_res_types=pocket_res,
-                pocket_bond_types=torch.argmax(pocket_bonds, dim=-1),
+                pocket_bond_types=pocket_bond_type_ids,
                 pocket_atom_mask=pocket_mask,
                 pocket_equis=pocket_equis,
                 pocket_invs=pocket_invs,
@@ -1453,7 +1495,7 @@ class LigandPocketCFM(pl.LightningModule):
 
     def training_step(self, batch, b_idx):
         # Input data
-        _, data, interpolated, times = batch
+        prior, data, interpolated, times = batch
 
         # Extract pocket data
         pocket_data = self.builder.extract_pocket_from_complex(data)
@@ -1465,6 +1507,7 @@ class LigandPocketCFM(pl.LightningModule):
         lig_data = self.builder.extract_ligand_from_complex(data)
         lig_data["interactions"] = data["interactions"]
         lig_data["pocket_mask"] = pocket_data["mask"]
+        lig_data["complex"] = data.get("complex")
         times = [times[:, 0], times[:, 1], times[:, 2], times[:, 3]]
 
         cond_batch = None
@@ -1525,6 +1568,10 @@ class LigandPocketCFM(pl.LightningModule):
 
         losses = self._loss(lig_data, lig_interp, predicted, times=ligand_times)
         loss = sum(list(losses.values()))
+        if rl_chunkwise_manual_enabled(self):
+            loss, rl_logs = run_rl_chunkwise_manual_optimization(self, loss, prior, data)
+        else:
+            loss, rl_logs = maybe_apply_rl_finetune_loss(self, loss, prior, data)
 
         for name, loss_val in losses.items():
             self.log(
@@ -1536,11 +1583,25 @@ class LigandPocketCFM(pl.LightningModule):
                 sync_dist=True,
             )
 
+        for name, log_val in rl_logs.items():
+            self.log(
+                name,
+                log_val,
+                prog_bar=False,
+                on_step=True,
+                logger=True,
+                sync_dist=True,
+            )
+
         self.log(
             "train-loss", loss, prog_bar=True, on_step=True, logger=True, sync_dist=True
         )
 
         return loss
+
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        on_train_batch_end_update_reference(self)
 
     def validation_step(self, batch, b_idx):
         # Input data
