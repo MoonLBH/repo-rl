@@ -1589,6 +1589,7 @@ class LigandPocketCFM(pl.LightningModule):
                 log_val,
                 prog_bar=False,
                 on_step=True,
+                on_epoch=False,
                 logger=True,
                 sync_dist=True,
             )

@@ -97,7 +97,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use_ema", action="store_true", help="Ignored in this RL entry; the explicit RL reference model has its own EMA.")
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--n_validation_mols", type=int, default=DEFAULT_N_VALIDATION_MOLS)
-    parser.add_argument("--ckpt_every_n_train_steps", type=int, default=1000, help="Save RL checkpoints every N training steps.")
+    parser.add_argument("--ckpt_monitor", default="train-rl-ckpt-score", help="Step-level RL reward metric monitored for best checkpoint saving.")
+    parser.add_argument("--ckpt_monitor_mode", default="max", choices=["min", "max"], help="Optimization direction for --ckpt_monitor.")
+    parser.add_argument("--ckpt_save_top_k", type=int, default=5, help="Keep the top-K checkpoints according to --ckpt_monitor.")
+    parser.add_argument("--ckpt_every_n_train_steps", type=int, default=1, help="Check the RL checkpoint monitor every N training steps.")
     parser.add_argument("--ckpt_save_last", action=argparse.BooleanOptionalAction, default=True, help="Whether to keep last.ckpt for RL fine-tuning.")
 
     # Generation / RL candidate sampling semantics aligned with generate_from_smol.
@@ -340,20 +343,22 @@ def build_rl_trainer(args: argparse.Namespace, model: Any):
     print("[RL fine-tune] Logger: TensorBoard only")
     print(f"[RL fine-tune] TensorBoard log dir: {tensorboard_dir}")
 
-    ckpt_callback = ModelCheckpoint(
-        dirpath=str(checkpoint_dir),
-        filename="step-{step}",
-        save_top_k=-1,
+    reward_ckpt_callback = ModelCheckpoint(
+        dirpath=str(checkpoint_dir / "best_reward"),
+        filename="best-reward-step-{step}-{train-rl-ckpt-score:.4f}",
+        monitor=args.ckpt_monitor,
+        mode=args.ckpt_monitor_mode,
+        save_top_k=int(args.ckpt_save_top_k),
         every_n_train_steps=max(1, int(args.ckpt_every_n_train_steps)),
         every_n_epochs=0,
         save_last=bool(args.ckpt_save_last),
-        monitor=None,
+        auto_insert_metric_name=False,
     )
     callbacks = [
         LearningRateMonitor(logging_interval="step"),
         TQDMProgressBar(refresh_rate=5),
         ModelSummary(max_depth=2),
-        ckpt_callback,
+        reward_ckpt_callback,
     ]
 
     trainer_gradient_clip_val = float(args.gradient_clip_val or 0.0)

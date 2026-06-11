@@ -428,6 +428,7 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-vina-mean": 0.0,
         "train-rl-main-score-mean": 0.0,
         "train-rl-main-score-max": 0.0,
+        "train-rl-ckpt-score": -1.0e9,
         "train-rl-invalid-count": 0.0,
         "train-rl-posebusters-failed-count": 0.0,
         "train-rl-plif-failed-count": 0.0,
@@ -453,6 +454,7 @@ def base_logs(model: Any) -> dict[str, Any]:
         "train-rl-delta-charge-abs-mean": 0.0,
         "train-rl-delta-coord-abs-mean": 0.0,
         "train-rl-reward-top-mean": 0.0,
+        "train-rl-reward-top-max": 0.0,
         "train-rl-reward-bottom-mean": 0.0,
         "train-rl-reward-top10-mean": 0.0,
     }
@@ -1755,15 +1757,30 @@ def reward_summary_logs(rewards: Sequence[Mapping[str, Any]], selection: Mapping
 
 
 def reward_selection_logs(rewards: Sequence[Mapping[str, Any]], selection: Mapping[str, Any]) -> dict[str, Any]:
-    scores = [float(r.get("main_score", 0.0)) for r in rewards]
-    top_scores = [scores[idx] for idx in selection.get("top_indices", [])]
-    bottom_scores = [scores[idx] for idx in selection.get("bottom_indices", [])]
+    scores: list[float] = []
+    for reward in rewards:
+        try:
+            value = float(reward.get("main_score", 0.0))
+        except (TypeError, ValueError):
+            value = 0.0
+        scores.append(value if math.isfinite(value) else 0.0)
+
+    top_scores = [scores[int(idx)] for idx in selection.get("top_indices", [])]
+    bottom_scores = [scores[int(idx)] for idx in selection.get("bottom_indices", [])]
     sorted_scores = sorted(scores, reverse=True)
     top10 = sorted_scores[: max(1, min(10, len(sorted_scores)))] if sorted_scores else []
+
+    # Checkpoint score is valid only when this step has top training signal.
+    # This prevents bottom-only/no-top steps from becoming best reward checkpoints.
+    top_max = max(top_scores) if top_scores else 0.0
+    ckpt_score = top_max if top_scores else -1.0e9
+
     return {
         "train-rl-reward-top-mean": mean_or_zero(top_scores),
+        "train-rl-reward-top-max": float(top_max),
         "train-rl-reward-bottom-mean": mean_or_zero(bottom_scores),
         "train-rl-reward-top10-mean": mean_or_zero(top10),
+        "train-rl-ckpt-score": float(ckpt_score),
     }
 
 
